@@ -1,0 +1,3791 @@
+#!/usr/bin/python
+# -*- coding: UTF-8 -*-
+
+#  Diabetpy - Control for your diabetes
+#
+#  More information on: https://code.google.com/p/diabetpy
+#  Copyright (C) 2014  Miguel Collado
+
+#  This program is free software; you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation; either version 2 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program; if not, write to the Free Software
+#  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+#  MA 02110-1301, USA.
+
+import sqlite3
+import ConfigParser
+import traceback
+
+import md5
+
+import curses
+import curses.textpad
+
+from datetime import datetime, date, time, timedelta
+from calendar import monthrange
+
+from os.path import expanduser
+from os.path import exists
+from os import mkdir, getenv, putenv
+
+try:
+    import Gnuplot
+    gplot = True
+
+except:
+    gplot = False
+
+app_version = "v0.8.3"
+app_title = "Diabetpy " + app_version
+
+# A todos los métodos hay que pasarles listas
+class UtilForLists():
+    def getMean(self, values):
+        n = len(values)
+        if n == 0:
+            return 0
+        else:
+            total = 0
+            for v in values:
+                total += v
+            return total / float(n)
+
+    def getMedian(self, values):
+        values.sort()
+        elements = len(values)
+        if elements:
+            if elements % 2 == 0:
+                return float((values[elements / 2] +\
+                 values[(elements / 2) - 1]) / 2.0)
+            else:
+                return values[(elements / 2)]
+        else:
+            return 0
+
+    def getMax(self, values):
+        if values:
+            return max(values)
+        return 0
+
+    def getMin(self, values):
+        if values:
+            return min(values)
+        return 0
+
+    def uniq(self, values):
+        seen = set()
+        seen_add = seen.add
+        return [ x for x in values if x not in seen and not seen_add(x)]
+
+class Food():
+    List = []
+    FidsToDelete = []
+
+    # ftypes
+    FOOD = "1"
+    COMPLEXFOOD = "2"
+    FAVORITE = "3"
+
+    def add(self, fname, ftype, fcpercent, fid = None):
+        self.fid = fid
+        self.fname = fname
+        self.ftype = ftype
+        self.fcpercent = fcpercent
+        Food.List.append(self)
+
+    def deleteByName(self, fname):
+        food = self.getFoodObjectByName(fname)
+        Food.List.remove(food)
+
+    def getFoodObjectByName(self, fname):
+        for food in Food.List:
+            if food.fname == fname:
+                return food
+        return False
+
+    def getCPercentByFName(self, fname):
+        for food in Food.List:
+            if food.fname == fname:
+                return food.fcpercent
+        return False
+
+    def isFNameFree(self, fname):
+        for food in Food.List:
+            if food.fname == fname:
+                return False
+        return True
+
+    def setCPercentByName(self, fname, fcpercent):
+        for food in Food.List:
+            if food.fname == fname:
+                food.fcpercent = fcpercent
+                return True
+        return False
+
+
+    def getListByType(self, ftype):
+        l = []
+        for food in Food.List:
+            if ftype in food.ftype:
+                l.append(food)
+        return l
+
+    def getListNamesSorted(self):
+        fnames = []
+        for food in Food.List:
+            fnames.append(food.fname)
+        fnames.sort()
+        return fnames
+
+    def getListNamesSortedByType(self, ftype):
+        fnames = []
+        for food in Food.List:
+            if ftype in food.ftype:
+                fnames.append(food.fname)
+        fnames.sort()
+        return fnames
+
+    def favoriteFoodByName(self, fname):
+        for food in Food.List:
+            if fname == food.fname and Food.FAVORITE not in food.ftype:
+                food.ftype += " " + Food.FAVORITE
+                return True
+        return False
+
+    def unfavoriteFoodByName(self, fname):
+        for food in Food.List:
+            if fname == food.fname and Food.FAVORITE in food.ftype:
+                food.ftype = food.ftype[0:-2]
+                return True
+        return False
+
+
+class Profiles():
+    RELATIVE = "0"
+    ABSOLUTE = "1"
+
+    ProfilesAppliedStr = ""
+
+    List = []
+    Selected = None
+    Default = None
+
+    Bm = 0.0
+    Bb = 0.0
+    Lm = 0.0
+    Lb = 0.0
+    Dm = 0.0
+    Db = 0.0
+
+    def modifyFunction(self, carbhydr, dose, meal, o):
+        """
+        Modificamos la pendiente dejando fija una de las regiones de la
+        gráfica.
+        más info en: https ://code.google.com/p/diabetpy
+        """
+
+        carbhydrlow = 0
+        carbhydrhigh = 0
+        doselow = 0
+        dosehigh = 0
+
+        if o[0:1] == 'r':
+            carbhydrlow = int(o[1:5])
+            carbhydrhigh = carbhydr
+
+            doselow = Profiles().getDose(carbhydrlow, meal)
+            dosehigh = dose
+
+            while doselow >= dosehigh:
+                carbhydrlow -= 10
+                doselow = Profiles().getDose(carbhydrlow, meal)
+
+        elif o[0:1] == 'l':
+            carbhydrlow = carbhydr
+            carbhydrhigh = int(o[1:5])
+
+            doselow = dose
+            dosehigh = Profiles().getDose(carbhydrhigh, meal)
+
+            while doselow >= dosehigh:
+                carbhydrhigh += 10
+                dosehigh = Profiles().getDose(carbhydrhigh, meal)
+
+        elif o == 'm':
+            di = dose - Profiles().getDose(carbhydr, meal)
+
+            carbhydrlow = 10
+            carbhydrhigh = 120
+
+            doselow = Profiles().getDose(carbhydrlow, meal)
+            dosehigh = Profiles().getDose(carbhydrhigh, meal)
+
+            doselow += di
+            dosehigh += di
+
+        m = float(dosehigh - doselow) / (carbhydrhigh - carbhydrlow)
+        b = doselow - (carbhydrlow * m)
+
+        if m > 0:
+            # aquí se pueden dar dos posibilidades
+            # 1.- default + quizás algunos relativos
+            # tocará repasar todos los relativos que aplican y restar a b.
+            # después, se asignan a Default y se guardan los perfiles
+
+            # 2.- otro perfilabsoluto
+            # se asignan al perfil los nuevos valores
+
+            if Profiles.Selected.pname == "Default":
+                for profile in Profiles.List:
+                    if profile.ptype == Profiles.RELATIVE and\
+                     Profiles().checkIfProgramApplies(profile.program):
+                        if meal == "breakfast":
+                            b -= float(profile.brb)
+                        elif meal == "lunch":
+                            b -= float(profile.lub)
+                        elif meal == "dinner":
+                            b -= float(profile.dib)
+
+            if meal == "breakfast":
+                Profiles.Selected.brm = m
+                Profiles.Selected.brb = b
+            elif meal == "lunch":
+                Profiles.Selected.lum = m
+                Profiles.Selected.lub = b
+            elif meal == "dinner":
+                Profiles.Selected.dim = m
+                Profiles.Selected.dib = b
+
+        else:
+            return False
+
+        Profiles().calculateParams()
+        main.database.saveProfiles()
+
+        return True
+
+
+    def new(self, pid, pname, ptype):
+        # atributos de cada objeto Profiles creado con el método new
+        self.pname = pname
+        self.ptype = ptype
+        self.selected = False
+        self.program = ""
+        self.pid = pid
+
+        self.brm = 0.0
+        self.brb = 0.0
+        self.lum = 0.0
+        self.lub = 0.0
+        self.dim = 0.0
+        self.dib = 0.0
+
+        # Mantenemos una lista de todos los Profiles creados con el método new
+        Profiles.List.append(self)
+
+    def remove(self):
+        Profiles.List.remove(self)
+        main.database.deleteProfile(self.pname)
+
+    def setSelected(self):
+        if self.ptype == Profiles.ABSOLUTE:
+            # Ponemos el resto de perfiles a False y el elegido a True
+            for p in Profiles.List:
+                if p.ptype == Profiles.ABSOLUTE and p != self:
+                    p.selected = False
+
+            self.selected = True
+            Profiles.Selected = self
+
+    def setProgram(self, program):
+        self.program = program
+
+    def setParams(self, p1, p2, p3, p4 = 0.0, p5 = 0.0, p6 = 0.0):
+        if self.ptype == Profiles.RELATIVE:
+            self.brm = 0.0
+            self.brb = p1
+            self.lum = 0.0
+            self.lub = p2
+            self.dim = 0.0
+            self.dib = p3
+
+        elif self.ptype == Profiles.ABSOLUTE:
+            self.brm = p1
+            self.brb = p2
+            self.lum = p3
+            self.lub = p4
+            self.dim = p5
+            self.dib = p6
+
+    def getProfileByName(self, pname):
+        for profile in Profiles.List:
+            if profile.pname == pname:
+                return profile
+        return False
+
+    def getListByType(self, ptype):  # returns a list of elements
+        ret = []
+        for profile in Profiles.List:
+            if profile.ptype == ptype:
+                ret.append(profile)
+        return ret
+
+    def getParamsByMeal(self, meal):
+        if meal == "breakfast":
+            return Profiles.Bm, Profiles.Bb
+
+        if meal == "lunch":
+            return Profiles.Lm, Profiles.Lb
+
+        if meal == "dinner":
+            return Profiles.Dm, Profiles.Db
+
+    def getDose(self, carbhydr, meal):
+        """
+        Retorna la dosis a administrarse en función de la
+        cantidad de hidratos especificada.
+        """
+        Profiles().calculateParams()
+
+        m, b = Profiles().getParamsByMeal(meal)
+
+        if m:
+            return (carbhydr * float(m)) + float(b)
+        else:
+            return False
+
+    def calculateParams(self):
+
+        savetodb = False
+
+        Profiles.ProfilesAppliedStr = ""
+
+        dp = Profiles.Default # default profile dp
+        sp = Profiles.Selected # selected profile sp
+
+        brm, brb, lum, lub, dim, dib = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+        # Antes de nada revisamos si algún perfil absoluto está programado
+        # Si sí lo está lo seleccionamos. Aplica el último programado!..
+        for profile in Profiles.List:
+            if profile != dp and profile != sp and \
+            profile.ptype == Profiles.ABSOLUTE and \
+            Profiles().checkIfProgramApplies(profile.program):
+                profile.setSelected()
+                sp = Profiles.Selected
+                savetodb = True
+
+        # ¿el perfil Default está seleccionado?
+        if dp.selected:
+
+            dstbm = float(dp.brm)
+            dstbb = float(dp.brb)
+            dstlm = float(dp.lum)
+            dstlb = float(dp.lub)
+            dstdm = float(dp.dim)
+            dstdb = float(dp.dib)
+
+            # Por si tiene una aplicación paulatina
+            # dfe = days from epoch (int)
+            # dta = days to apply (int)
+            # src* = source params of functions (floats todos)
+            dfe,\
+            dta,\
+            srcbm,\
+            srcbb,\
+            srclm,\
+            srclb,\
+            srcdm,\
+            srcdb = Profiles().getDaysToApplyCompletely(dp.program)
+
+            dfenow = (datetime.today().date() - datetime.utcfromtimestamp(0).date()).days
+
+            if dfe and dfe <= dfenow: # si True es que aplica paulatinamente desde hoy.
+                dayspassed = dfenow - dfe
+                if dayspassed >= dta:
+                    # hay que eliminar el aplicado paulatino, por lo que se alcanzó
+                    # el número de días.
+                    dp.program = Profiles().deleteGradualApplyFromProgram(dp.program)
+
+                    savetodb = True
+
+                    Profiles.ProfilesAppliedStr += dp.pname
+
+                else:
+                    # hay que calcular las funciones al vuelo
+
+                    srclodose = (20 * srcbm) + srcbb
+                    srchidose = (120 * srcbm) + srcbb
+                    dstlodose = (20 * dstbm) + dstbb
+                    dsthidose = (120 * dstbm) + dstbb
+
+                    lodose = (((dstlodose - srclodose) / float(dta)) * dayspassed) + srclodose
+                    hidose = (((dsthidose - srchidose) / float(dta)) * dayspassed) + srchidose
+
+                    brm = (hidose - lodose) / float(120 - 20)
+                    brb = lodose - (20 * brm)
+
+                    srclodose = (20 * srclm) + srclb
+                    srchidose = (120 * srclm) + srclb
+                    dstlodose = (20 * dstlm) + dstlb
+                    dsthidose = (120 * dstlm) + dstlb
+
+                    lodose = (((dstlodose - srclodose) / float(dta)) * dayspassed) + srclodose
+                    hidose = (((dsthidose - srchidose) / float(dta)) * dayspassed) + srchidose
+
+                    lum = (hidose - lodose) / float(120 - 20)
+                    lub = lodose - (20 * lum)
+
+                    srclodose = (20 * srcdm) + srcdb
+                    srchidose = (120 * srcdm) + srcdb
+                    dstlodose = (20 * dstdm) + dstdb
+                    dsthidose = (120 * dstdm) + dstdb
+
+                    lodose = (((dstlodose - srclodose) / float(dta)) * dayspassed) + srclodose
+                    hidose = (((dsthidose - srchidose) / float(dta)) * dayspassed) + srchidose
+
+                    dim = (hidose - lodose) / float(120 - 20)
+                    dib = lodose - (20 * dim)
+
+                    Profiles.Bm,\
+                    Profiles.Bb,\
+                    Profiles.Lm,\
+                    Profiles.Lb,\
+                    Profiles.Dm,\
+                    Profiles.Db = brm, brb, lum, lub, dim, dib
+
+                    Profiles.ProfilesAppliedStr += dp.pname + " (Gradual " +\
+                     str(dayspassed) + "/" + str(dta) + ")"
+
+            else:
+                Profiles.Bm = dstbm
+                Profiles.Bb = dstbb
+                Profiles.Lm = dstlm
+                Profiles.Lb = dstlb
+                Profiles.Dm = dstdm
+                Profiles.Db = dstdb
+
+                Profiles.ProfilesAppliedStr += dp.pname
+
+            # hay que ver si aplica algún relativo y se sacan las funciones
+            for profile in Profiles().getListByType(Profiles.RELATIVE):
+                applies = Profiles().checkIfProgramApplies(profile.program)
+                expired = Profiles().checkIfProgramAreExpired(profile.program)
+                if applies and ':' not in dp.program: # si se está aplicando algún gradual apply no saltan los relativos
+                    Profiles.Bb += float(profile.brb) # Si cualquiera es negativo restará en lugar
+                    Profiles.Lb += float(profile.lub) # de sumar.
+                    Profiles.Db += float(profile.dib)
+                    Profiles.ProfilesAppliedStr += " + " + profile.pname
+                elif expired:
+                    # si es True es que hay dos fechas, inicio y fin y que ha expirado.
+                    # Las eliminamos del programa
+                    profile.program = Profiles().deleteDatesFromProgram(profile.program)
+
+                    savetodb = True
+
+
+        # ¿el perfil Default no está seleccionado?
+        else:
+            # ¿está seleccionado algún absoluto con programa?
+            if sp.program and sp.ptype == Profiles.ABSOLUTE:
+
+                # Por si tiene una aplicación paulatina
+                # dfe = days from epoch (int)
+                # dta = days to apply (int)
+                # src* = source params of functions (floats todos)
+                dfe,\
+                dta,\
+                srcbm,\
+                srcbb,\
+                srclm,\
+                srclb,\
+                srcdm,\
+                srcdb = Profiles().getDaysToApplyCompletely(sp.program)
+
+                dfenow = (datetime.today().date() - datetime.utcfromtimestamp(0).date()).days
+
+                # ¿el programa aplica en el dia en el que estamos?
+                applies = Profiles().checkIfProgramApplies(sp.program) # True si aplica
+                expired = Profiles().checkIfProgramAreExpired(sp.program) # True si expiró
+                stillnotapply = Profiles().checkIfProgramStillNotApply(sp.program) # True si no aplica aún
+
+                # Si aplica es porque lo habremos programado para ello
+                # Y si aún no aplica es porque lo habremos seleccionado a mano.
+                # Así pues, se cogen los datos para las funciones destino.
+                if applies or stillnotapply:
+                    dstbm = float(sp.brm)
+                    dstbb = float(sp.brb)
+                    dstlm = float(sp.lum)
+                    dstlb = float(sp.lub)
+                    dstdm = float(sp.dim)
+                    dstdb = float(sp.dib)
+
+
+                    if dfe and dfenow >= dfe: # si True es que aplica desde hoy.
+                        dayspassed = dfenow - dfe
+                        if dayspassed >= dta:
+                            # hay que eliminar el aplicado paulatino, por lo que se alcanzó
+                            # el número de días y programamos el aplicado paulatino en el default
+                            program = ""
+                            for pro in sp.program.split(" "):
+                                if ":" in pro:
+                                    program = str(dfenow) # first parameter days from epoch
+                                    program += ":" + pro.split(":")[1] #second is days to apply
+                                    program += ":" + str(sp.brm) # and everything else is por functions
+                                    program += ":" + str(sp.brb)
+                                    program += ":" + str(sp.lum)
+                                    program += ":" + str(sp.lub)
+                                    program += ":" + str(sp.dim)
+                                    program += ":" + str(sp.dib)
+
+                            # lo seteamos en el perfil default
+                            # lo asignamos sin más porque el perfil Default no puede
+                            # ser programado
+                            dp.program = program
+
+
+                            # quitamos el gradual apply en el sp (selected profile)
+                            sp.program = Profiles().deleteGradualApplyFromProgram(sp.program)
+
+                            brm = dstbm
+                            brb = dstbb
+                            lum = dstlm
+                            lub = dstlb
+                            dim = dstdm
+                            dib = dstdb
+
+                            savetodb = True
+
+                            Profiles.ProfilesAppliedStr += sp.pname
+
+                        else:
+                            # hay que calcular las funciones al vuelo
+
+                            srclodose = (20 * srcbm) + srcbb
+                            srchidose = (120 * srcbm) + srcbb
+                            dstlodose = (20 * dstbm) + dstbb
+                            dsthidose = (120 * dstbm) + dstbb
+
+                            lodose = (((dstlodose - srclodose) / float(dta)) * dayspassed) + srclodose
+                            hidose = (((dsthidose - srchidose) / float(dta)) * dayspassed) + srchidose
+
+                            brm = (hidose - lodose) / float(120 - 20)
+                            brb = lodose - (20 * brm)
+
+                            srclodose = (20 * srclm) + srclb
+                            srchidose = (120 * srclm) + srclb
+                            dstlodose = (20 * dstlm) + dstlb
+                            dsthidose = (120 * dstlm) + dstlb
+
+                            lodose = (((dstlodose - srclodose) / float(dta)) * dayspassed) + srclodose
+                            hidose = (((dsthidose - srchidose) / float(dta)) * dayspassed) + srchidose
+
+                            lum = (hidose - lodose) / float(120 - 20)
+                            lub = lodose - (20 * lum)
+
+                            srclodose = (20 * srcdm) + srcdb
+                            srchidose = (120 * srcdm) + srcdb
+                            dstlodose = (20 * dstdm) + dstdb
+                            dsthidose = (120 * dstdm) + dstdb
+
+                            lodose = (((dstlodose - srclodose) / float(dta)) * dayspassed) + srclodose
+                            hidose = (((dsthidose - srchidose) / float(dta)) * dayspassed) + srchidose
+
+                            dim = (hidose - lodose) / float(120 - 20)
+                            dib = lodose - (20 * dim)
+
+                            Profiles.ProfilesAppliedStr += sp.pname + " (Gradual "\
+                             + str(dayspassed) + "/" + str(dta) + ")"
+
+                    else:
+                        brm = dstbm
+                        brb = dstbb
+                        lum = dstlm
+                        lub = dstlb
+                        dim = dstdm
+                        dib = dstdb
+
+                        Profiles.ProfilesAppliedStr += sp.pname
+
+                    Profiles.Bm,\
+                    Profiles.Bb,\
+                    Profiles.Lm,\
+                    Profiles.Lb,\
+                    Profiles.Dm,\
+                    Profiles.Db = brm, brb, lum, lub, dim, dib
+
+                elif expired:
+
+                    # si nos hemos pasado de fecha se selecciona Default de nuevo
+                    # y al perfil se le quita el programa
+                    program = ""
+                    for pro in sp.program.split(" "):
+                        if ":" in pro:
+                            print pro
+                            program = str(dfenow) # first parameter days from epoch
+                            program += ":" + pro.split(':')[1] #second is days to apply
+                            program += ":" + str(sp.brm) # and everything else is por functions
+                            program += ":" + str(sp.brb)
+                            program += ":" + str(sp.lum)
+                            program += ":" + str(sp.lub)
+                            program += ":" + str(sp.dim)
+                            program += ":" + str(sp.dib)
+
+                    # lo seteamos en el perfil default sólo si aún no fue
+                    # seteado más atrás en el tiempo.
+                    if ':' not in dp.program and program:
+                        dp.program = program
+
+                    # lo que puede expirar son las fechas, por lo que las quitamos
+                    # dejamos los posibles días de la semana que pudiese tener
+                    # añadidos. También quitamos el Gradual Apply
+                    sp.program = Profiles().deleteDatesFromProgram(sp.program)
+                    sp.program = Profiles().deleteGradualApplyFromProgram(sp.program)
+
+                    dp.setSelected()
+
+                    sp = dp
+                    savetodb = True
+
+                    # después de los cambios efectuados hay que recalcular los
+                    # parámetros llamándose a sí mismo el método.
+                    Profiles().calculateParams()
+
+            else:
+                # se sacan las funciones del perfil ya que seleccionado
+                # más no programa = seleccionado por el usuario
+
+                Profiles.Bm,\
+                Profiles.Bb,\
+                Profiles.Lm,\
+                Profiles.Lb,\
+                Profiles.Dm,\
+                Profiles.Db = sp.brm, sp.brb, sp.lum, sp.lub, sp.dim, sp.dib
+
+                Profiles.ProfilesAppliedStr += sp.pname
+
+        if savetodb:
+            main.database.saveProfiles()
+
+
+
+    def deleteGradualApplyFromProgram(self, program):
+        futureprogram = ""
+        for pro in program.split(" "):
+            if ':' not in pro:
+                futureprogram += pro + " "
+        futureprogram = futureprogram[0:-1]
+        return futureprogram
+
+    def deleteDatesFromProgram(self, program):
+        futureprogram = ""
+        for pro in program.split(" "):
+            if ':' in pro or not '-' in pro:
+                futureprogram += pro + " "
+        futureprogram = futureprogram[0:-1]
+        return futureprogram
+
+    def getDatesFromProgram(self, program):
+        startdate = enddate = None
+
+        for pro in program.split(" "):
+            if "-" in pro and ':' not in pro:
+                # es una fecha
+                if not startdate:
+                    startdate = datetime.strptime(pro, "%Y-%m-%d").date()
+                else:
+                    enddate = datetime.strptime(pro, "%Y-%m-%d").date()
+        return startdate, enddate
+
+    def getDaysToApplyCompletely(self, program):
+        dfe, dta, bm, bb, lm, lb, dm, db = \
+        0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+        for pro in program.split(" "):
+            if ':' in pro:
+                dfe, dta, bm, bb, lm, lb, dm, db = pro.split(':')
+                dfe = int(dfe)
+                dta = int(dta) - 10
+                bm = float(bm)
+                bb = float(bb)
+                lm = float(lm)
+                lb = float(lb)
+                dm = float(dm)
+                db = float(db)
+
+        return dfe, dta, bm, bb, lm, lb, dm, db
+
+    def checkIfProgramApplies(self, program):
+        startdate = None
+        enddate = None
+
+        today = date.today()
+        weekday = today.weekday()
+
+        for pro in program.split(" "):
+            if "-" in pro and ':' not in pro:
+                # es una fecha
+                if not startdate:
+                    startdate = datetime.strptime(pro, "%Y-%m-%d").date()
+                else:
+                    enddate = datetime.strptime(pro, "%Y-%m-%d").date()
+
+                if (startdate and startdate == today) or (startdate and enddate and today >= startdate and today <= enddate):
+                    return True
+
+            elif str(weekday) == pro:
+                # es un dia de la semana
+                return True
+
+        return False
+
+
+    def checkIfProgramAreExpired(self, program):
+        today = date.today()
+
+        startdate = None
+        enddate = None
+
+        for pro in program.split(" "):
+            if "-" in pro and ':' not in pro:
+                # es una fecha
+                if not startdate:
+                    startdate = datetime.strptime(pro, "%Y-%m-%d").date()
+                else:
+                    enddate = datetime.strptime(pro, "%Y-%m-%d").date()
+
+        if enddate and today > enddate: # True si ha expirado
+            return True
+        else:
+            return False
+
+
+    def checkIfProgramStillNotApply(self, program):
+        today = date.today()
+        startdate = None
+        enddate = None
+
+        for pro in program.split(" "):
+            if "-" in pro and ':' not in pro:
+                # es una fecha
+                if not startdate:
+                    startdate = datetime.strptime(pro, "%Y-%m-%d").date()
+                else:
+                    enddate = datetime.strptime(pro, "%Y-%m-%d").date()
+
+        if startdate and today < startdate: # True si no aplica aún
+            return True
+        else:
+            return False
+
+
+class DpyDb():
+    """
+    Implementa los métodos para trabajar con la
+    base de datos.
+    La función tiene la forma: y = m*x + b
+    y = dosis
+    m = pendiente
+    x = cantidad de hidratos de carbono
+    b = índice
+    """
+
+    def __init__(self):
+        """
+        Checked = Si ha sido revisado en la db
+
+        Obtained = Si hemos obtenido la función, ya sea mediante
+        calculo sobre los valores de la tabla meals, o de la tabla
+        functions.
+
+        Slope = pendiente (m)
+        funcindex = índice (b)
+        """
+        self.startoftheday = "00:00:00"
+        self.dbpath = ""
+        self.datetime = ""
+
+    def __now(self):
+        """
+        Actualiza los atributos de fecha y hora en el instante
+        en que es llamado
+        """
+        d = str(date.today())
+        t = str(datetime.now().time())[0:8]
+
+        self.datetime = d + " " + t
+
+    def createDatabase(self):
+        # Crea la base de datos y su estructura de tablas.
+        con = sqlite3.connect(self.dbpath)
+        con.executescript("""
+        CREATE TABLE meals(
+            id INTEGER PRIMARY KEY,
+            datetime TEXT,
+            meal TEXT,
+            carbonhydrates REAL,
+            dose REAL,
+            textmeal TEXT,
+            md5sumforfunctions
+        );
+
+        CREATE TABLE glycemys(
+            id INTEGER PRIMARY KEY,
+            datetime TEXT,
+            time TEXT,
+            level INTEGER
+        );
+
+        CREATE TABLE profiles(
+            id INTEGER PRIMARY KEY,
+            name TEXT UNIQUE,
+            type TEXT,
+            selected TEXT,
+            program TEXT,
+            breakfastm REAL,
+            breakfastb REAL,
+            lunchm REAL,
+            lunchb REAL,
+            dinnerm REAL,
+            dinnerb REAL
+        );
+
+        INSERT INTO profiles (
+
+        name,
+        type,
+        selected,
+        breakfastm,
+        breakfastb,
+        lunchm,
+        lunchb,
+        dinnerm,
+        dinnerb
+
+        ) VALUES (
+
+        'Default',
+        'absolute',
+        'True',
+        '0.0',
+        '0.0',
+        '0.0',
+        '0.0',
+        '0.0',
+        '0.0'
+
+        );
+
+        CREATE TABLE food(
+            id INTEGER PRIMARY KEY,
+            name TEXT UNIQUE,
+            type TEXT,
+            cpercent REAL
+        );
+
+        """)
+
+        con.commit()
+        con.close()
+
+    def checkDatabase(self):
+        if exists(self.dbpath):
+            return True
+        return False
+
+    def loadProfiles(self):
+        con = sqlite3.connect(self.dbpath)
+        cur = con.cursor()
+        cur.execute("SELECT * FROM profiles")
+
+        for row in cur.fetchall():
+            pid = row[0]
+            pname = row[1]
+            ptype = row[2]
+            selected = row[3]
+            program = row[4]
+            brm = row[5]
+            brb = row[6]
+            lum = row[7]
+            lub = row[8]
+            dim = row[9]
+            dib = row[10]
+
+            if not brm:
+                brm = "0.0"
+            if not brb:
+                brb = "0.0"
+            if not lum:
+                lum = "0.0"
+            if not lub:
+                lub = "0.0"
+            if not dim:
+                dim = "0.0"
+            if not dib:
+                dib = "0.0"
+
+            if ptype == "absolute":
+                ptype = Profiles.ABSOLUTE
+
+            elif ptype == "relative":
+                ptype = Profiles.RELATIVE
+
+            p = Profiles()
+            p.new(pid, pname, ptype)
+
+            if p.pname == "Default":
+                Profiles.Default = p
+
+            if program:
+                p.setProgram(program)
+
+            if ptype == Profiles.RELATIVE:
+                p.setParams(brb, lub, dib)
+
+            elif ptype == Profiles.ABSOLUTE:
+                p.setParams(brm, brb, lum, lub, dim, dib)
+
+            if selected == "True":
+                p.selected = True
+                Profiles.Selected = p
+            else:
+                p.selected = False
+
+
+    def calculateParamsFromDatabase(self):
+        """
+        Método que checkea si las funciones están calculadas en la tabla
+        functions y en caso contrario intenta calcularlas de la tabla main
+        """
+
+        notcalculated = ""
+        if not Profiles.Bm and not Profiles.Bb:
+            notcalculated += "breakfast "
+        if not Profiles.Lm and not Profiles.Lb:
+            notcalculated += "lunch "
+        if not Profiles.Dm and not Profiles.Db:
+            notcalculated += "dinner "
+
+        if notcalculated:
+            notcalculated = notcalculated[0:-1]
+
+        con = sqlite3.connect(self.dbpath)
+        for meal in notcalculated.split(" "):
+
+            min_carbhydr = 0
+            max_carbhydr = 0
+            min_dose = 0
+            max_dose = 0
+
+            cur = con.cursor()
+
+            cur.execute("""
+            SELECT carbonhydrates, dose FROM meals WHERE
+            meal = ? ORDER BY carbonhydrates LIMIT 1""",
+            (meal, ))
+
+            row = cur.fetchone()
+            if row:
+                min_carbhydr = row[0]
+                min_dose = row[1]
+
+            cur.execute("""
+            SELECT carbonhydrates, dose FROM meals WHERE
+            meal = ? ORDER BY carbonhydrates DESC LIMIT 1""",
+            (meal, ))
+
+            row = cur.fetchone()
+            if row:
+                max_carbhydr = row[0]
+                max_dose = row[1]
+
+            m = b = 0.0
+
+            if round(min_dose) != round(max_dose) and min_carbhydr > 0 and \
+            max_carbhydr > 0:
+
+                m = float(max_dose - min_dose) / (
+                    max_carbhydr - min_carbhydr)
+
+                b = min_dose - (min_carbhydr * m)
+
+            if m:
+                if meal == "breakfast":
+                    Profiles.Default.brm = m
+                    Profiles.Default.brb = b
+
+                elif meal == "lunch":
+                    Profiles.Default.lum = m
+                    Profiles.Default.lub = b
+
+                elif meal == "dinner":
+                    Profiles.Default.dim = m
+                    Profiles.Default.dib = b
+
+                Profiles().calculateParams()
+                main.database.saveProfiles()
+
+        con.close()
+
+    def saveProfiles(self):
+        """
+        Actualiza los perfiles en la base de datos.
+        """
+        con = sqlite3.connect(self.dbpath)
+        for p in Profiles.List:
+
+            # preparamos los perfiles para ser insertados
+            selected = str(p.selected)
+
+            ptype = ""
+            if p.ptype == Profiles.ABSOLUTE:
+                ptype = "absolute"
+            elif p.ptype == Profiles.RELATIVE:
+                ptype = "relative"
+
+            cur = con.cursor()
+            if p.pid:
+                cur.execute("""
+                UPDATE profiles SET name=?,type=?,selected=?,program=?,breakfastm=?,\
+                breakfastb=?,lunchm=?,lunchb=?,dinnerm=?,dinnerb=? WHERE id=?""",
+                (p.pname, ptype, selected, p.program, p.brm, p.brb, p.lum, p.lub,\
+                p.dim, p.dib, p.pid,))
+
+            else: # no existe, la insertamos
+                cur.execute("""
+                INSERT INTO profiles (name,type,selected,program,breakfastm,\
+                breakfastb,lunchm,lunchb,dinnerm,dinnerb) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (p.pname, ptype, selected, p.program, p.brm, p.brb, p.lum, p.lub,
+                p.dim, p.dib,))
+
+        con.commit()
+        con.close()
+
+    def getLastRecommendation(self, meal):
+        """
+        Retorna la última recomendación realizada.
+        """
+        con = sqlite3.connect(self.dbpath)
+        cur = con.cursor()
+        cur.execute("""SELECT id, carbonhydrates, dose, textmeal,
+        md5sumforfunctions FROM meals WHERE meal=? ORDER BY datetime DESC LIMIT 1""",
+         (meal,))
+
+        row = cur.fetchone()
+
+        if row:
+            iddb = row [0]
+            carbhydr = row[1]
+            dose = row[2]
+            text = row[3]
+            md5sum = row[4]
+        else:
+            iddb, carbhydr, dose, text, md5sum =\
+             False, False, False, False, False
+
+        con.close()
+        return iddb, carbhydr, dose, text, md5sum
+
+    def deleteMealById(self, Id):
+        """
+        Elimina la última recomendación realizada.
+        """
+        con = sqlite3.connect(self.dbpath)
+        cur = con.cursor()
+        cur.execute("""DELETE FROM meals WHERE id=?""",(Id,))
+        con.commit()
+        con.close()
+
+    def deleteProfile(self, pname):
+        """
+        Elimina el perfil con nombre tal.
+        """
+        con = sqlite3.connect(self.dbpath)
+        cur = con.cursor()
+        cur.execute("""DELETE FROM profiles WHERE name=?""", (pname,))
+        con.commit()
+        con.close()
+
+
+    def deleteLastGlycemy(self):
+        """
+        Elimina la última glucemia
+        """
+        con = sqlite3.connect(self.dbpath)
+        cur = con.cursor()
+        cur.execute("""DELETE FROM glycemys ORDER BY id DESC LIMIT 1""")
+        con.commit()
+        con.close()
+
+    def doVacuum(self):
+        """
+        Realiza VACUUM
+        """
+        con = sqlite3.connect(self.dbpath)
+        cur = con.cursor()
+        cur.execute("""VACUUM""")
+        con.commit()
+        con.close()
+        return True
+
+    def getMiddleCarbh(self, meal):
+        """
+        Retorna la media de hidratos que sueles
+        comer para una determinada comida
+        """
+        proceed = False
+        if meal == 'breakfast' or meal == 'lunch' or meal == 'dinner':
+            proceed = True
+
+        if proceed:
+            con = sqlite3.connect(self.dbpath)
+            cur = con.cursor()
+            cur.execute("""SELECT carbonhydrates FROM meals
+            WHERE meal=? ORDER BY datetime DESC LIMIT 10""", (meal,))
+            num = 0
+            total = 0
+            for carb in cur.fetchall():
+                num += 1
+                total += float(carb[0])
+            con.close()
+            if num > 0:
+                return total / num
+            else:
+                return False
+        else:
+            return False
+
+    def getLastMealsRecords(self):
+        con = sqlite3.connect(self.dbpath)
+        cur = con.cursor()
+        ids, datetimes, meals, carbs, doses, texts = [], [], [], [], [], []
+        cur.execute("""SELECT id,datetime,meal,carbonhydrates,dose,textmeal FROM meals ORDER BY datetime DESC LIMIT 100""")
+        for row in cur.fetchall():
+            ids.append(row[0])
+            datetimes.append(row[1])
+            meals.append(row[2])
+            carbs.append(row[3])
+            doses.append(row[4])
+            texts.append(row[5])
+        con.close()
+        return ids, datetimes, meals, carbs, doses, texts
+
+
+    def getGplotBufferForFunctions(self, name, bm, bb, lm, lb, dm, db):
+        br = True
+        lu = True
+        di = True
+
+        if not bm:
+            br = False
+        if not lm:
+            lu = False
+        if not dm:
+            di = False
+
+        if not bm and not lm and not dm:
+            return False
+
+        gplotbuffer = ""
+        gplotbuffer += "reset\n"
+
+        gplotbuffer += "set " + setupvars.gplotterm + " " + \
+            setupvars.gplotsizesmall + "\n"
+
+        gplotbuffer += "set title 'Diabetpy functions for " + \
+            name + "\n"
+
+        gplotbuffer += "set xlabel 'Carbonhydrates(gr)'\n"
+        gplotbuffer += "set ylabel 'Doses'\n"
+        gplotbuffer += "set xrange[20:120]\n"
+        gplotbuffer += "set yrange[0:]\n"
+        gplotbuffer += "set xtics border in scale 0,0 nomirror rotate by\
+        -40  offset character 0, 0, 0\n"
+        gplotbuffer += "set grid xtics ytics\n"
+        gplotbuffer += "plot "
+
+        if br:
+            gplotbuffer += "x*" + str(bm) + "+" + str(bb) +\
+            "w l lw 1.5 lt rgb 'gold' t 'Breakfast function',"
+
+        if lu:
+            gplotbuffer += "x*" + str(lm) + "+" + str(lb) +\
+            "w l lw 1.5 lt rgb '#00a000' t 'Lunch function',"
+
+        if di:
+            gplotbuffer += "x*" + str(dm) + "+" + str(db) +\
+            "w l lw 1.5 lt rgb '#00509d' t 'Dinner function'"
+
+        if gplotbuffer[-1] == ',':
+            gplotbuffer = gplotbuffer[:-1]
+
+        gplotbuffer += "\n"
+
+        return gplotbuffer
+
+    def getGplotBufferForGeneralView(self, begindate):
+
+        data = False
+        sotd = " " + main.database.startoftheday
+        diff = date.today() - begindate
+        ndays = diff.days
+
+        startdate = str(date.today() - timedelta(days=ndays))
+        enddate = str(date.today() - timedelta(days=(ndays - 1)))
+        stopdate = str(date.today() + timedelta(days=1))
+
+        gplotbuffer = ""
+        gplotbuffer += "reset\n"
+
+        gplotbuffer += "set " + setupvars.gplotterm + " " + \
+            setupvars.gplotsizelong + "\n"
+
+        gplotbuffer += "set title 'Diabetpy General View with data since " \
+            + startdate + "'\n"
+
+        gplotbuffer += "set xlabel 'Dates'\n"
+        gplotbuffer += "set ylabel 'Glycemy level'\n"
+        gplotbuffer += "set yrange[40:]\n"
+        gplotbuffer += "set grid xtics ytics\n"
+        gplotbuffer += "set xtics border in scale 0,0 nomirror rotate by\
+        -40  offset character 0, 0, 0\n"
+
+        gplotbuffer += "plot\
+        '-' u 2:xtic(1) w lp lw 1.5 lt rgb '#eb0000' t 'Max level',\
+        '-' u 2 w lp lw 1.5 lt rgb '#0060ad' t 'Min level',\
+        '-' u 2 w lp lw 1.5 lt rgb '#009944' t 'Mean',\
+        '-' u 2 w lp lw 1.5 lt rgb '#003322' t 'Median'\n"
+
+        maxbuffer = ""
+        minbuffer = ""
+        meanbuffer = ""
+        medianbuffer = ""
+
+        while startdate != stopdate:
+            con = sqlite3.connect(self.dbpath)
+            cur = con.cursor()
+            cur.execute("""
+            SELECT level FROM glycemys WHERE datetime>=? AND datetime<?
+            """, (startdate + sotd, enddate + sotd,))
+
+            glycemys = []
+            for level in cur.fetchall():
+                data = True
+                glycemys.append(float(level[0]))
+
+
+            ma =  UtilForLists().getMax(glycemys)
+            mi =  UtilForLists().getMin(glycemys)
+            mea = UtilForLists().getMean(glycemys)
+            med = UtilForLists().getMedian(glycemys)
+
+            maxbuffer += startdate + " " + str(ma) + "\n"
+            minbuffer += startdate + " " + str(mi) + "\n"
+            meanbuffer += startdate + " " + str(mea) + "\n"
+            medianbuffer += startdate + " " + str(med) + "\n"
+
+            ndays -= 1
+            startdate = str(date.today()-timedelta(days=ndays))
+            enddate = str(date.today()-timedelta(days=(ndays - 1)))
+
+        maxbuffer += "e\n"
+        minbuffer += "e\n"
+        meanbuffer += "e\n"
+        medianbuffer += "e\n"
+
+        gplotbuffer += maxbuffer
+        gplotbuffer += minbuffer
+        gplotbuffer += meanbuffer
+        gplotbuffer += medianbuffer
+
+        if data:
+            return gplotbuffer
+        else:
+            return False
+
+    def getGplotBufferForDayView(self, begindate):
+
+        sotd = " " + self.startoftheday
+        diff = date.today() - begindate
+        ndays = diff.days
+
+        startdate = str(date.today()-timedelta(days=ndays))
+
+        gplotbuffer = ""
+        gplotbuffer += "reset\n"
+
+        gplotbuffer += "set " + setupvars.gplotterm + " " + \
+            setupvars.gplotsizesmall + "\n"
+
+        gplotbuffer += "set title 'Diabetpy Day View with data since " + \
+            startdate + "'\n"
+
+        gplotbuffer += "set xlabel 'Hours'\n"
+        gplotbuffer += "set ylabel 'Glycemy level'\n"
+        gplotbuffer += "set yrange[40:]\n"
+        gplotbuffer += "set grid xtics ytics\n"
+        gplotbuffer += "set xtics border in scale 0,0 nomirror rotate by\
+        -40  offset character 0, 0, 0\n"
+
+        gplotbuffer += "plot\
+        '-' u 2:xtic(1) w lp lw 1.5 lt rgb '#eb0000' t 'Max level',\
+        '-' u 2 w lp lw 1.5 lt rgb '#0060ad' t 'Min level',\
+        '-' u 2 w lp lw 1.5 lt rgb '#009944' t 'Mean',\
+        '-' u 2 w lp lw 1.5 lt rgb '#003322' t 'Median'\n"
+
+        maxbuffer = ""
+        minbuffer = ""
+        meanbuffer = ""
+        medianbuffer = ""
+
+        sh = int(sotd.split(":")[0])
+
+        def process_hour(h):
+            con = sqlite3.connect(self.dbpath)
+            cur = con.cursor()
+            cur.execute('SELECT level FROM glycemys WHERE datetime>? and \
+            datetime LIKE ?', (startdate, '%' + str(h) + ':%:%',))
+
+            glycemys = []
+            for level in cur.fetchall():
+                glycemys.append(float(level[0]))
+
+            ma = UtilForLists().getMax(glycemys)
+            mi = UtilForLists().getMin(glycemys)
+            mea = UtilForLists().getMean(glycemys)
+            med = UtilForLists().getMedian(glycemys)
+
+            if ma == 0: ma = ""
+            else: process_hour.data += 1
+            if mi == 0: mi = ""
+            else: process_hour.data += 1
+            if mea == 0: mea = ""
+            else: process_hour.data += 1
+            if med == 0: med = ""
+            else: process_hour.data += 1
+
+            maxbufferline = str(h) + ":00 " + str(ma) + "\n"
+            minbufferline = str(h) + ":00 " + str(mi) + "\n"
+            meanbufferline = str(h) + ":00 " + str(mea) + "\n"
+            medianbufferline = str(h) + ":00 " + str(med) + "\n"
+
+            return maxbufferline, minbufferline, meanbufferline, \
+                medianbufferline
+
+        process_hour.data = 0
+
+        for h in range(sh, 24):
+            if h < 10:
+                h = "0" + str(h)
+            maxbufferline, minbufferline, meanbufferline, \
+                medianbufferline = process_hour(h)
+
+            maxbuffer += maxbufferline
+            minbuffer += minbufferline
+            meanbuffer += meanbufferline
+            medianbuffer += medianbufferline
+
+
+        for h in range(sh):
+            if h < 10:
+                h = "0" + str(h)
+            maxbufferline, minbufferline, meanbufferline, \
+                medianbufferline = process_hour(h)
+
+            maxbuffer += maxbufferline
+            minbuffer += minbufferline
+            meanbuffer += meanbufferline
+            medianbuffer += medianbufferline
+
+
+        maxbuffer += "e\n"
+        minbuffer += "e\n"
+        meanbuffer += "e\n"
+        medianbuffer += "e\n"
+
+        gplotbuffer += maxbuffer
+        gplotbuffer += minbuffer
+        gplotbuffer += meanbuffer
+        gplotbuffer += medianbuffer
+
+        if process_hour.data > 4:
+            return gplotbuffer
+        else:
+            return False
+
+    def getGplotBufferForIntakeView(self, begindate, meal):
+        diff = date.today() - begindate
+        ndays = diff.days
+
+        startdate = str(date.today()-timedelta(days=ndays))
+        data = False
+
+        gplotbuffer = ""
+        gplotbuffer += "reset\n"
+
+        gplotbuffer += "set " + setupvars.gplotterm + " " + \
+            setupvars.gplotsizesmall + "\n"
+
+        gplotbuffer += "set title 'Diabetpy Intake View with data since "\
+             + startdate + "'\n"
+
+        gplotbuffer += "set xlabel 'Carbonhydrates'\n"
+        gplotbuffer += "set ylabel 'Glycemy level'\n"
+        gplotbuffer += "set style data histogram\n"
+        gplotbuffer += "set yrange[40:]\n"
+        gplotbuffer += "set boxwidth 1.0\n"
+        gplotbuffer += "set style fill solid border -1\n"
+        gplotbuffer += "set grid xtics ytics\n"
+        gplotbuffer += "set xtics border in scale 0,0 nomirror rotate by\
+        -40  offset character 0, 0, 0\n"
+
+        gplotbuffer += "plot\
+        '-' u 2:xtic(1) lt rgb '#4460ad' t 'Mean before " + meal + "', \
+        '-' u 2:xtic(1) lt rgb '#eb4444' t 'Mean after " + meal + "'\n"
+
+        beforebuffer = ""
+        afterbuffer = ""
+
+        for n in range(2,13):
+            con = sqlite3.connect(self.dbpath)
+            cur = con.cursor()
+
+            cur.execute('SELECT datetime FROM meals WHERE carbonhydrates\
+             like ? and meal = ? and datetime >= ?', (str(n) + '_.%',
+             meal, startdate,))
+
+            dates = []
+            for row in cur.fetchall():
+                dates.append(row[0].split(" ")[0])
+
+            if dates:
+                dates = UtilForLists().uniq(dates)
+                glycemysbefore = []
+                glycemysafter = []
+                for d in dates:
+
+                    con = sqlite3.connect(self.dbpath)
+                    cur = con.cursor()
+
+                    cur.execute('SELECT time, level FROM glycemys WHERE \
+                        datetime like ? and time like ?', (d + "%", "%" + \
+                        meal,))
+
+                    for row in cur.fetchall():
+                        if row[0] == "Before " + meal:
+                            glycemysbefore.append(row[1])
+                            data = True
+                        elif row[0] == "After " + meal:
+                            glycemysafter.append(row[1])
+                            data = True
+
+                medb = UtilForLists().getMean(glycemysbefore)
+                meda = UtilForLists().getMean(glycemysafter)
+
+                beforebuffer += str(n) + "0gr " + str(medb) + "\n"
+                afterbuffer += str(n) + "0gr " + str(meda) + "\n"
+
+            else:
+                beforebuffer += str(n) + "0gr 0\n"
+                afterbuffer += str(n) + "0gr 0\n"
+
+        beforebuffer += "e\n"
+        afterbuffer += "e\n"
+
+        gplotbuffer += beforebuffer
+        gplotbuffer += afterbuffer
+
+        if data:
+            return gplotbuffer
+        else:
+            return False
+
+
+    def insertGlycemy(self, time, glycemy):
+        """
+        Inserta en la db una glucemia determinada.
+        """
+        if time == "bb": time = "Before breakfast"
+        elif time == "ab": time = "After breakfast"
+        elif time == "bl": time = "Before lunch"
+        elif time == "al": time = "After lunch"
+        elif time == "bd": time = "Before dinner"
+        elif time == "ad": time = "After dinner"
+        elif time == "in": time = "In the night"
+
+        self.__now()
+        con = sqlite3.connect(self.dbpath)
+        con.execute("""INSERT INTO glycemys
+        (datetime, time, level) VALUES (?, ?, ?)""",
+        (self.datetime, time, glycemy))
+        con.commit()
+        con.close()
+
+
+    def insertMeal(self, meal, carbhydr, dose, textmeal, md5sum):
+        """
+        Inserta en la db una comida concreta.
+        """
+        self.__now()
+        con = sqlite3.connect(self.dbpath)
+
+        # md5sum es hexdigest de: str(m) + '/' + str(b)
+        # puede ser util
+
+        con.execute("""INSERT INTO meals (datetime, meal,
+        carbonhydrates, dose, textmeal, md5sumforfunctions) VALUES (?,?,?,?,?,?)""",
+        (self.datetime, meal, carbhydr, dose, textmeal, md5sum,))
+
+        con.commit()
+        con.close()
+
+    def loadFood(self):
+        """
+        Retorna un diccionario con todos los alimentos
+        añadidos en la tabla food.
+        """
+        Food.List = []
+
+        con = sqlite3.connect(self.dbpath)
+        cur = con.cursor()
+        cur.execute("SELECT * FROM food")
+        for row in cur.fetchall():
+            fid = row[0]
+            fname = row[1]
+            ftype = row[2]
+            fcpercent = row[3]
+            food = Food()
+            food.add(fname, ftype, fcpercent, fid)
+
+        con.close()
+
+    def saveFood(self):
+        # primero eliminamos los que hay que eliminar
+        con = sqlite3.connect(self.dbpath)
+        for fid in Food.FidsToDelete:
+            cur = con.cursor()
+            cur.execute("DELETE FROM food WHERE id=?", (fid,))
+        Food.FidsToDelete = []
+
+        for food in Food.List:
+            cur = con.cursor()
+            if food.fid:
+                cur.execute(\
+                "UPDATE food SET name=?, type=?, cpercent=? WHERE id=?",
+                (food.fname, food.ftype, food.fcpercent, food.fid,))
+            else:
+                cur.execute(\
+                "INSERT INTO food (name, type, cpercent) VALUES (?,?,?)",
+                (food.fname, food.ftype, food.fcpercent,))
+
+        Food.List = []
+
+        con.commit()
+        con.close()
+
+    def modifyAnnotationById(self, iddb, nd, md5sum):
+        """
+        Modifica la dosis para una anotación en la DB cuando la función
+        aún no fue generada.
+        """
+        con = sqlite3.connect(self.dbpath)
+        cur = con.cursor()
+        cur.execute("UPDATE meals SET dose=?,md5sumforfunctions=? WHERE id=?", (nd, md5sum, iddb,))
+        con.commit()
+        con.close()
+
+        return True
+
+
+class DpyMenu:
+    def __init__(self):
+        self.__prepare_curses()
+        self.__define_atributes()
+        self.__set_principal_screen("")
+
+    def __prepare_curses(self):
+        if not getenv("ESCDELAY"):
+            putenv("ESCDELAY", "25")
+        self.SC = curses.initscr()
+        self.SC.keypad(1)
+
+        curses.start_color()
+
+        curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN) # highlighted selection on windows
+        curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLUE) # normal text on windows
+        curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLUE)  # error text on windows
+        curses.init_pair(4, curses.COLOR_YELLOW, curses.COLOR_BLUE) # text for headers and footers
+        curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_WHITE) # Master BackGround
+
+        curses.noecho()
+        curses.cbreak()
+        curses.curs_set(0)
+
+    def __set_principal_screen(self, title, footer = ""):
+        maxy, maxx = self.SC.getmaxyx()
+        self.SC.erase()
+        self.SC.attron(curses.color_pair(5))
+        self.SC.bkgd(" ", curses.color_pair(5))
+        self.__setFooter(footer)
+        self.__setTitle(title)
+
+
+    def __setFooter(self, footer = ""):
+        maxy, maxx = self.SC.getmaxyx()
+        if maxx >= 80 and maxy >= 24:
+            self.SC.addstr(maxy - 2, 0, footer.center(maxx), self.T)
+            self.SC.refresh()
+
+    def __setTitle(self, title):
+        maxy, maxx = self.SC.getmaxyx()
+        if maxx >= 80 and maxy >= 24:
+            self.SC.addstr(1, 0, title.center(maxx), self.T)
+            self.SC.refresh()
+
+    def __define_atributes(self):
+        """
+        Dejamos el menú sin respetar los 80 caracteres de ancho como
+        máximo paradógicamente por resultar más legible.
+        """
+        self.MENU = (
+            {'title': "Meals >", 'footer': "Take a meal, get recommendations and much more", 'type': "MENU", 'options': (
+                {'title': "Take breakfast", 'footer': "", 'type': "MEAL_MENU", 'options': "breakfast"},
+                {'title': "Take lunch", 'footer': "", 'type': "MEAL_MENU", 'options': "lunch"},
+                {'title': "Take dinner", 'footer': "", 'type': "MEAL_MENU", 'options': "dinner"},
+                {'title': "-"},
+                {'title': "Take generic meal without recommendation", 'footer': "Annotate a meal in database without recommendation", 'type': "MEAL_MENU", 'options': "generic meal"},
+                {'title': "-"},
+                {'title': "Add complex food to food list", 'footer': "Add food that consist of more food and calculate its carbonhydrates percent", 'type': "MEAL_MENU", 'options': "complex food"},
+                {'title': "-"},
+                {'title': "Go back <", 'footer': "Go to previous menu", 'type': "BACK", 'options': ""},
+            )},
+            {'title': "Modify last recomendation >", 'footer': "Options to modify the last recomendation of Diabetpy", 'type': "MENU", 'options': (
+                {'title': "Modify last recommendation of breakfast >", 'footer': "", 'type': "MENU", 'options': (
+                    {'title': "Modify it by its index", 'footer': "This will change all future recommendations alike", 'type': "MODIFY_MENU", 'options': "breakfast-m"},
+                    {'title': "Modify it the left", 'footer': "This will change the slope of the function, from lighter intakes", 'type': "MODIFY_MENU", 'options': "breakfast-l120"},
+                    {'title': "Modify it by the right", 'footer': "This will change the slope of the function, from copious intakes", 'type': "MODIFY_MENU", 'options': "breakfast-r30"},
+                    {'title': "-"},
+                    {'title': "Modify by the left with a fixed point", 'footer': "Same that above, but with a fixed carbonhydrates point", 'type': "MODIFY_MENU", 'options': "breakfast-lfix"},
+                    {'title': "Modify by the right with a fixed point", 'footer': "Same that above, but with a fixed carbonhydrates point", 'type': "MODIFY_MENU", 'options': "breakfast-rfix"},
+                    {'title': "-"},
+                    {'title': "Go back <", 'footer': "Go to previous menu", 'type': "BACK", 'options': ""},
+                )},
+                {'title': "Modify last recommendation of lunch >", 'footer': "", 'type': "MENU", 'options': (
+                    {'title': "Modify it by its index", 'footer': "This will change all future recommendations alike", 'type': "MODIFY_MENU", 'options': "lunch-m"},
+                    {'title': "Modify it by the left", 'footer': "This will change the slope of the function, from lighter intakes", 'type': "MODIFY_MENU", 'options': "lunch-l120"},
+                    {'title': "Modify it by the right", 'footer': "This will change the slope of the function, from copious intakes", 'type': "MODIFY_MENU", 'options': "lunch-r30"},
+                    {'title': "-"},
+                    {'title': "Modify by the left with a fixed point", 'footer': "Same that above, but with a fixed carbonhydrates point", 'type': "MODIFY_MENU", 'options': "lunch-lfix"},
+                    {'title': "Modify by the right with a fixed point", 'footer': "Same that above, but with a fixed carbonhydrates point", 'type': "MODIFY_MENU", 'options': "lunch-rfix"},
+                    {'title': "-"},
+                    {'title': "Go back <", 'footer': "Go to previous menu", 'type': "BACK", 'options': ""},
+                )},
+                {'title': "Modify last recommendation of dinner >", 'footer': "", 'type': "MENU", 'options': (
+                    {'title': "Modify it by its index", 'footer': "This will change all future recommendations alike", 'type': "MODIFY_MENU", 'options': "dinner-m"},
+                    {'title': "Modify it by the left", 'footer': "This will change the slope of the function, from lighter intakes", 'type': "MODIFY_MENU", 'options': "dinner-l120"},
+                    {'title': "Modify it by the right", 'footer': "This will change the slope of the function, from copious intakes", 'type': "MODIFY_MENU", 'options': "dinner-r30"},
+                    {'title': "-"},
+                    {'title': "Modify by the left with a fixed point", 'footer': "Same that above, but with a fixed carbonhydrates point", 'type': "MODIFY_MENU", 'options': "dinner-lfix"},
+                    {'title': "Modify by the right with a fixed point", 'footer': "Same that above, but with a fixed carbonhydrates point", 'type': "MODIFY_MENU", 'options': "dinner-rfix"},
+                    {'title': "-"},
+                    {'title': "Go back <", 'footer': "Go to previous menu", 'type': "BACK", 'options': ""},
+                )},
+                {'title': "-"},
+                {'title': "Go back <", 'footer': "Go to previous menu", 'type': "BACK", 'options': ""},
+            )},
+            {'title': "Annotate a glycemy", 'footer': "For annotate glycemys onto the database", 'type': "ACTION", 'options': "glycemy"},
+            {'title': "Profiles", 'footer': "Select and edit profiles, each one with different functions", 'type': "ACTION", 'options': "profiles"},
+            {'title': "-"},
+            {'title': "Gnuplot charts >", 'footer': "Charts generated by Gnuplot", 'type': "MENU", 'options': (
+                {'title': "Glycemys General View chart", 'footer': "Shows mean/median/max/min glycemy levels for each day", 'type': "CHARTS", 'options': "gv"},
+                {'title': "Glycemys Day View chart", 'footer': "Shows mean/median/max/min glycemy levels in a day view", 'type': "CHARTS", 'options': "dv"},
+                {'title': "Glycemys for Intake View chart >", 'footer': "Shows mean glycemy levels before and after diferent amounts of intake", 'type': "MENU", 'options': (
+                    {'title': "For breakfast", 'footer': "", 'type': "CHARTS", 'options': "iv-breakfast"},
+                    {'title': "For lunch", 'footer': "", 'type': "CHARTS", 'options': "iv-lunch"},
+                    {'title': "For dinner", 'footer': "", 'type': "CHARTS", 'options': "iv-dinner"},
+                    {'title': "-"},
+                    {'title': "Go back <", 'footer': "Go to previous menu", 'type': "BACK", 'options': ""},
+                )},
+                {'title': "-"},
+                {'title': "Plot functions", 'footer': "Shows you the functions generated", 'type': "CHARTS", 'options': "drawfunctions"},
+                {'title': "-"},
+                {'title': "Go back <", 'footer': "Go to previous menu", 'type': "BACK", 'options': ""},
+            )},
+            {'title': "-"},
+            {'title': "Advanced >", 'footer': "Options for test purposes", 'type': "MENU", 'options': (
+                {'title': "Execute VACUUM in database", 'footer': "Free unused space in database", 'type': "ACTION", 'options': "dbvacuum"},
+                {'title': "-"},
+                {'title': "Explore records in meals table", 'footer': "About the last 100 anotations in meals table", 'type': "ACTION", 'options': "deletemeal"},
+                {'title': "Delete last record in glycemys(BE CAREFUL!)", 'footer': "This is for test purposes only", 'type': "ACTION", 'options': "deletelastglycemy"},
+                {'title': "-"},
+                {'title': "Go back <", 'footer': "Go to previous menu", 'type': "BACK", 'options': ""},
+            )},
+            {'title': "-"},
+            {'title': "Quit <", 'footer': "Quits the aplication", 'type': "EXIT", 'options': ""}
+        )
+
+
+        self.MENUROOT = self.MENU
+        self.POS = 0
+        self.PARENTMENU = [ None ]
+        self.OLDPOS = [ None ]
+
+        maxy, maxx = self.SC.getmaxyx()
+        if maxx < 80 or maxy < 24:
+            raise curses.error("Screen resolution insufficient.")
+
+        self.H = curses.color_pair(1)
+        self.T = curses.color_pair(4) | curses.A_BOLD
+        self.N = curses.color_pair(2)
+        self.ER = curses.color_pair(3) | curses.A_BOLD
+        self.MB = curses.color_pair(5)  # master background
+
+        self.APPTITLE = "Welcome to " + app_title
+
+    def runDatabase(self):
+        maxy, maxx = self.SC.getmaxyx()
+        height = maxy - 4
+        width = maxx
+        dbwin = self.SC.subwin(height, width, 2, 0)
+
+        dbmy, dbmx = dbwin.getmaxyx()
+        ids, datetimes, meals, carbs, doses, texts = main.database.getLastMealsRecords()
+
+
+        topindex = 0
+        bottomindex = dbmy - 3
+        pos = 0
+
+        c = None
+        while c != 27:
+            def redraw():
+                main.menu.__setTitle("Meals in database")
+                main.menu.__setFooter("d - Delete record / up/down - Navigate through menu")
+                dbwin.erase()
+                dbwin.attron(curses.color_pair(2))
+                dbwin.bkgd(" ", curses.color_pair(2))
+
+                cell = dbmx / 10
+                dbwin.addstr(0, 1, " ".center(maxx - 2), self.N)
+                dbwin.addstr(0, 1, "Date", self.T)
+                dbwin.addstr(0, cell * 2 - 2, "Time", self.T)
+                dbwin.addstr(0, cell * 3 + 1, "Meal", self.T)
+                dbwin.addstr(0, cell * 5 - 2, "Carb.", self.T)
+                dbwin.addstr(0, cell * 6 - 2, "Dose", self.T)
+                dbwin.addstr(0, cell * 7 - 2, "Text", self.T)
+
+                dbwin.hline(1, 0, curses.ACS_HLINE, maxx)
+                dbwin.hline(dbmy - 1, 0, curses.ACS_HLINE, maxx)
+
+                redraw.opts = 0
+                for index in ids[topindex:bottomindex]:
+                    da = datetimes[topindex + redraw.opts].split(" ")[0]
+                    ti = datetimes[topindex + redraw.opts].split(" ")[1]
+                    s = self.N
+                    if redraw.opts == pos:
+                        s = self.H
+                    dbwin.addstr(redraw.opts + 2, 1, da.ljust(cell * 2), s)
+                    dbwin.addstr(redraw.opts + 2, cell * 2 - 2, ti.ljust(cell * 2), s)
+                    dbwin.addstr(redraw.opts + 2, cell * 3 + 1, meals[topindex + redraw.opts].ljust(cell * 2), s)
+                    dbwin.addstr(redraw.opts + 2, cell * 5 - 2, str(round(carbs[topindex + redraw.opts], 1)).ljust(cell * 2), s)
+                    dbwin.addstr(redraw.opts + 2, cell * 6 - 2, str(round(doses[topindex + redraw.opts], 1)), s)
+                    dbwin.addstr(redraw.opts + 2, cell * 7 - 2, texts[topindex + redraw.opts][0:cell * 3 + 1].ljust(cell * 3 + 1), s)
+                    redraw.opts += 1
+
+                dbwin.refresh()
+
+
+            redraw()
+            redraw.opts -= 1
+            curses.flushinp()
+            c = self.SC.getch()
+
+            if c == curses.KEY_DOWN:
+                if pos == redraw.opts and pos < dbmy and ids[bottomindex:bottomindex + 1]:
+                    topindex += 1
+                    bottomindex += 1
+
+                elif pos < redraw.opts:
+                    pos += 1
+
+
+            elif c == curses.KEY_UP:
+                if pos == 0 and pos < topindex:
+                    topindex -= 1
+                    bottomindex -= 1
+
+                elif pos > 0:
+                    pos -= 1
+
+            elif c == ord('d'):
+                answer = main.menu.getYesNo()
+                if answer:
+                    n = pos + topindex
+                    main.database.deleteMealById(ids[n])
+                    del(ids[n])
+                    del(datetimes[n])
+                    del(carbs[n])
+                    del(doses[n])
+                    del(texts[n])
+
+    def runProfiles(self):
+        height = 10
+        width = 35
+        maxy, maxx = self.SC.getmaxyx()
+
+        # creamos las ventanas
+        abswin = self.SC.subwin(height, width,
+        (maxy / 2) - (height / 2) - 3, (maxx / 2) - width - 2)
+
+        relwin = self.SC.subwin(height, width,
+        (maxy / 2) - (height / 2) - 3, (maxx / 2) + 2)
+
+        abspnames = []
+        relpnames = []
+        abspnameslen = 0
+        relpnameslen = 0
+
+
+        absview = True
+        abspos = 0
+        abstopindex = 0
+        absbottomindex = height - 2
+
+        relview = False
+        relpos = 0
+        reltopindex = 0
+        relbottomindex = height - 2
+
+        c = None
+        while c != 27:
+
+            def runEditAddProfile(profile = None):
+
+                pname = None
+                ptype = None
+                selected = None
+                program = None
+
+                brm = brb = 0.0
+                lum = lub = 0.0
+                dim = dib = 0.0
+
+                profilenames = []
+                for pro in Profiles.List:
+                    profilenames.append(pro.pname)
+
+                if profile:
+                    pname = profile.pname
+                    ptype = profile.ptype
+                    selected = profile.selected
+                    program = profile.program
+                    brm = profile.brm
+                    brb = profile.brb
+                    lum = profile.lum
+                    lub = profile.lub
+                    dim = profile.dim
+                    dib = profile.dib
+                else:
+                    pname = ""
+                    ptype = Profiles.ABSOLUTE
+                    selected = False
+                    program = ""
+                    brm = Profiles.Selected.brm
+                    brb = Profiles.Selected.brb
+                    lum = Profiles.Selected.lum
+                    lub = Profiles.Selected.lub
+                    dim = Profiles.Selected.dim
+                    dib = Profiles.Selected.dib
+
+                height = 13
+                width = 50
+
+                prowin = self.SC.subwin(height, width,
+                (maxy / 2) - (height / 2), (maxx / 2) - (width / 2))
+                promy, promx = prowin.getmaxyx()
+
+                pos = 0
+                c = None
+                while c != 27:
+                    def redraw2():
+                        footer = "ESC - Quit without changes / f - Finish saving the new profile"
+                        self.__setTitle("Profile editor")
+                        self.__setFooter(footer)
+
+                        prowin.erase()
+                        prowin.attron(curses.color_pair(2))
+                        prowin.bkgd(" ", curses.color_pair(2))
+                        prowin.box()
+
+                        strpname = pname
+
+                        strptype = None
+                        if ptype == Profiles.RELATIVE:
+                            strptype = 'relative'
+                        elif ptype == Profiles.ABSOLUTE:
+                            strptype = 'absolute'
+
+                        strselected = str(selected)
+
+                        strprogram = ""
+                        for pro in program.split(" "):
+                            if pro and ':' not in pro and '-' not in pro:
+                                if int(pro) < 7:
+                                    if int(pro) == 0:
+                                        strprogram += "Monday "
+                                    elif int(pro) == 1:
+                                        strprogram += "Tuesday "
+                                    elif int(pro) == 2:
+                                        strprogram += "Wenesday "
+                                    elif int(pro) == 3:
+                                        strprogram += "Thursday "
+                                    elif int(pro) == 4:
+                                        strprogram += "Friday "
+                                    elif int(pro) == 5:
+                                        strprogram += "Saturday "
+                                    elif int(pro) == 6:
+                                        strprogram += "Sunday "
+                            elif ':' not in pro:
+                                strprogram += pro + " "
+                            elif ':' in pro:
+                                strprogram = str(int(pro.split(':')[1]) - 10) + 'GA ' + strprogram
+                        if strprogram:
+                            strprogram = strprogram[0:-1]
+
+                        strbrm = str(brm)
+                        strbrb = str(brb)
+                        strlum = str(lum)
+                        strlub = str(lub)
+                        strdim = str(dim)
+                        strdib = str(dib)
+
+                        ti = ""
+                        if not strpname:
+                            ti = " Profile data "
+                        else:
+                            ti = " " + strpname + " "
+                        prowin.addstr(0, (promx / 2) - (len(ti) / 2), ti, self.T)
+
+                        halfsc = (width / 2)
+
+                        if pos == 0:
+                            prowin.addstr(1, 1, "Name:".ljust(halfsc), self.H)
+                            prowin.addstr(2, 1, "Type:".ljust(halfsc), self.N)
+                            prowin.addstr(4, 1, "Program:".ljust(halfsc), self.N)
+                            prowin.addstr(7, 1, "Breakfast b:".ljust(halfsc), self.N)
+                            prowin.addstr(9, 1, "Lunch b:".ljust(halfsc), self.N)
+                            prowin.addstr(11, 1, "Dinner b:".ljust(halfsc), self.N)
+                        elif pos == 1:
+                            prowin.addstr(1, 1, "Name:".ljust(halfsc), self.N)
+                            prowin.addstr(2, 1, "Type:".ljust(halfsc), self.H)
+                            prowin.addstr(4, 1, "Program:".ljust(halfsc), self.N)
+                            prowin.addstr(7, 1, "Breakfast b:".ljust(halfsc), self.N)
+                            prowin.addstr(9, 1, "Lunch b:".ljust(halfsc), self.N)
+                            prowin.addstr(11, 1, "Dinner b:".ljust(halfsc), self.N)
+                        elif pos == 2:
+                            prowin.addstr(1, 1, "Name:".ljust(halfsc), self.N)
+                            prowin.addstr(2, 1, "Type:".ljust(halfsc), self.N)
+                            prowin.addstr(4, 1, "Program:".ljust(halfsc), self.H)
+                            prowin.addstr(7, 1, "Breakfast b:".ljust(halfsc), self.N)
+                            prowin.addstr(9, 1, "Lunch b:".ljust(halfsc), self.N)
+                            prowin.addstr(11, 1, "Dinner b:".ljust(halfsc), self.N)
+                        elif pos == 3:
+                            prowin.addstr(1, 1, "Name:".ljust(halfsc), self.N)
+                            prowin.addstr(2, 1, "Type:".ljust(halfsc), self.N)
+                            prowin.addstr(4, 1, "Program:".ljust(halfsc), self.N)
+                            prowin.addstr(7, 1, "Breakfast b:".ljust(halfsc), self.H)
+                            prowin.addstr(9, 1, "Lunch b:".ljust(halfsc), self.N)
+                            prowin.addstr(11, 1, "Dinner b:".ljust(halfsc), self.N)
+                        elif pos == 4:
+                            prowin.addstr(1, 1, "Name:".ljust(halfsc), self.N)
+                            prowin.addstr(2, 1, "Type:".ljust(halfsc), self.N)
+                            prowin.addstr(4, 1, "Program:".ljust(halfsc), self.N)
+                            prowin.addstr(7, 1, "Breakfast b:".ljust(halfsc), self.N)
+                            prowin.addstr(9, 1, "Lunch b:".ljust(halfsc), self.H)
+                            prowin.addstr(11, 1, "Dinner b:".ljust(halfsc), self.N)
+                        elif pos == 5:
+                            prowin.addstr(1, 1, "Name:".ljust(halfsc), self.N)
+                            prowin.addstr(2, 1, "Type:".ljust(halfsc), self.N)
+                            prowin.addstr(4, 1, "Program:".ljust(halfsc), self.N)
+                            prowin.addstr(7, 1, "Breakfast b:".ljust(halfsc), self.N)
+                            prowin.addstr(9, 1, "Lunch b:".ljust(halfsc), self.N)
+                            prowin.addstr(11, 1, "Dinner b:".ljust(halfsc), self.H)
+
+                        prowin.addstr(3, 1, "Selected:", self.N)
+                        prowin.hline(5, 1, curses.ACS_HLINE, width - 2)
+                        prowin.addstr(6, 1, "Breakfast m:", self.N)
+                        prowin.addstr(8, 1, "Lunch m:", self.N)
+                        prowin.addstr(10, 1, "Dinner m:", self.N)
+
+                        if pos == 0:
+                            prowin.addstr(1, halfsc - 5, strpname.rjust(halfsc + 4), self.H)
+                            prowin.addstr(2, halfsc - 5, strptype.rjust(halfsc + 4), self.N)
+                            prowin.addstr(4, halfsc - 5, strprogram[0:halfsc + 4].rjust(halfsc + 4), self.N)
+                            prowin.addstr(7, halfsc - 5, strbrb.rjust(halfsc + 4), self.N)
+                            prowin.addstr(9, halfsc - 5, strlub.rjust(halfsc + 4), self.N)
+                            prowin.addstr(11, halfsc - 5, strdib.rjust(halfsc + 4), self.N)
+                        elif pos == 1:
+                            prowin.addstr(1, halfsc - 5, strpname.rjust(halfsc + 4), self.N)
+                            prowin.addstr(2, halfsc - 5, strptype.rjust(halfsc + 4), self.H)
+                            prowin.addstr(4, halfsc - 5, strprogram[0:halfsc + 4].rjust(halfsc + 4), self.N)
+                            prowin.addstr(7, halfsc - 5, strbrb.rjust(halfsc + 4), self.N)
+                            prowin.addstr(9, halfsc - 5, strlub.rjust(halfsc + 4), self.N)
+                            prowin.addstr(11, halfsc - 5, strdib.rjust(halfsc + 4), self.N)
+                        elif pos == 2:
+                            prowin.addstr(1, halfsc - 5, strpname.rjust(halfsc + 4), self.N)
+                            prowin.addstr(2, halfsc - 5, strptype.rjust(halfsc + 4), self.N)
+                            prowin.addstr(4, halfsc - 5, strprogram[0:halfsc + 4].rjust(halfsc + 4), self.H)
+                            prowin.addstr(7, halfsc - 5, strbrb.rjust(halfsc + 4), self.N)
+                            prowin.addstr(9, halfsc - 5, strlub.rjust(halfsc + 4), self.N)
+                            prowin.addstr(11, halfsc - 5, strdib.rjust(halfsc + 4), self.N)
+                        elif pos == 3:
+                            prowin.addstr(1, halfsc - 5, strpname.rjust(halfsc + 4), self.N)
+                            prowin.addstr(2, halfsc - 5, strptype.rjust(halfsc + 4), self.N)
+                            prowin.addstr(4, halfsc - 5, strprogram[0:halfsc + 4].rjust(halfsc + 4), self.N)
+                            prowin.addstr(7, halfsc - 5, strbrb.rjust(halfsc + 4), self.H)
+                            prowin.addstr(9, halfsc - 5, strlub.rjust(halfsc + 4), self.N)
+                            prowin.addstr(11, halfsc - 5, strdib.rjust(halfsc + 4), self.N)
+                        elif pos == 4:
+                            prowin.addstr(1, halfsc - 5, strpname.rjust(halfsc + 4), self.N)
+                            prowin.addstr(2, halfsc - 5, strptype.rjust(halfsc + 4), self.N)
+                            prowin.addstr(4, halfsc - 5, strprogram[0:halfsc + 4].rjust(halfsc + 4), self.N)
+                            prowin.addstr(7, halfsc - 5, strbrb.rjust(halfsc + 4), self.N)
+                            prowin.addstr(9, halfsc - 5, strlub.rjust(halfsc + 4), self.H)
+                            prowin.addstr(11, halfsc - 5, strdib.rjust(halfsc + 4), self.N)
+                        elif pos == 5:
+                            prowin.addstr(1, halfsc - 5, strpname.rjust(halfsc + 4), self.N)
+                            prowin.addstr(2, halfsc - 5, strptype.rjust(halfsc + 4), self.N)
+                            prowin.addstr(4, halfsc - 5, strprogram[0:halfsc + 4].rjust(halfsc + 4), self.N)
+                            prowin.addstr(7, halfsc - 5, strbrb.rjust(halfsc + 4), self.N)
+                            prowin.addstr(9, halfsc - 5, strlub.rjust(halfsc + 4), self.N)
+                            prowin.addstr(11, halfsc - 5, strdib.rjust(halfsc + 4), self.H)
+
+                        prowin.addstr(3, halfsc - 5, strselected.rjust(halfsc + 4), self.N)
+                        prowin.addstr(6, halfsc - 5, strbrm.rjust(halfsc + 4), self.N)
+                        prowin.addstr(8, halfsc - 5, strlum.rjust(halfsc + 4), self.N)
+                        prowin.addstr(10, halfsc - 5, strdim.rjust(halfsc + 4), self.N)
+
+                        prowin.refresh()
+                        self.SC.refresh()
+
+                    redraw2()
+                    curses.flushinp()
+                    c = self.SC.getch()
+
+                    if c == curses.KEY_DOWN:
+                        if ptype == Profiles.ABSOLUTE and pos < 2:
+                            pos += 1
+                        elif ptype == Profiles.RELATIVE and pos < 5:
+                            pos += 1
+
+                    elif c == curses.KEY_UP:
+                        if pos > 0:
+                            pos -= 1
+
+                    elif c == ord('\n'):
+                        doserange = range(10, -11, -1)
+                        for n in range(len(doserange)):
+                            if doserange[n] > 0:
+                                doserange[n] = "+" + str(float(doserange[n]))
+                            else:
+                                doserange[n] = str(float(doserange[n]))
+
+                        if pos == 0 and pname != "Default": # editamos el nombre
+                            answer = main.menu.getData("Name of the profile:")
+                            if answer:
+                                if answer not in profilenames:
+                                    if pname:
+                                        profilenames[profilenames.index(pname)] = answer
+                                    else:
+                                        profilenames.append(answer)
+                                    pname = answer
+
+                        elif pos == 1 and pname != "Default": # editamos el tipo
+                            selpos = 0
+                            if ptype == Profiles.RELATIVE:
+                                selpos = 1
+
+                            answer = main.menu.getSelection(\
+                            "Type of profile", ["absolute", "relative"], selpos)
+
+                            if answer == "absolute":
+                                ptype = Profiles.ABSOLUTE
+                                brm = Profiles.Selected.brm
+                                brb = Profiles.Selected.brb
+                                lum = Profiles.Selected.lum
+                                lub = Profiles.Selected.lub
+                                dim = Profiles.Selected.dim
+                                dib = Profiles.Selected.dib
+
+                            elif answer == "relative":
+                                ptype = Profiles.RELATIVE
+                                brm = 0.0
+                                brb = 0.0
+                                lum = 0.0
+                                lub = 0.0
+                                dim = 0.0
+                                dib = 0.0
+
+                        elif pos == 2: # editamos el programa
+                            options = []
+                            if pname == "Default":
+                                options = [
+                                "Reconfigure days of gradual apply",
+                                "-",
+                                "Clean program"\
+                                ]
+                            elif ptype == Profiles.RELATIVE:
+                                options = [
+                                "Add a weekday",
+                                "Select a date",
+                                "Select range of dates",
+                                "-",
+                                "Clean program"\
+                                ]
+                            else:
+                                options = [
+                                "Add a weekday",
+                                "Select a date",
+                                "Select range of dates",
+                                "-",
+                                "Configure a gradual apply",
+                                "Reconfigure days of gradual apply",
+                                "-",
+                                "Clean program"\
+                                ]
+                            answer = main.menu.getSelection("What do you want?", options)
+                            if answer:
+                                redraw2()
+                                if answer == "Add a weekday":
+                                    weekdays = ["Monday", "Tuesday", "Wenesday", "Thursday",
+                                    "Friday", "-", "Saturday", "Sunday"]
+                                    answer = main.menu.getSelection("Which weekday?", weekdays)
+                                    if answer:
+
+                                        while '-' in weekdays:
+                                            del(weekdays[weekdays.index('-')])
+
+                                        if program:
+                                            program += " " + str(weekdays.index(answer))
+                                        else:
+                                            program += str(weekdays.index(answer))
+
+                                elif answer == "Select range of dates" and ':' not in program:
+                                    startdate = main.menu.getDate(\
+                                    "Start date",
+                                    "Select the start date to begin to apply the profile")
+
+                                    enddate = main.menu.getDate(\
+                                    "End date",
+                                    "And now, select the end date for the apply to stop")
+
+                                    if startdate and enddate and startdate <= enddate:
+                                        # quitamos las fechas que pudiese haber
+                                        program = Profiles().deleteDatesFromProgram(program)
+                                        if program:
+                                            program = str(startdate) + " " + str(enddate) + " " + program
+                                        else:
+                                            program = str(startdate) + " " + str(enddate)
+
+                                    redraw()
+                                    redraw2()
+
+                                elif answer == "Configure a gradual apply":
+                                    startdate = main.menu.getDate(\
+                                    "Start date",
+                                    "Select the start date to begin to apply the profile")
+
+                                    enddate = main.menu.getDate(\
+                                    "End date",
+                                    "And now, select the end date for the apply to stop")
+                                    redraw()
+                                    redraw2()
+
+                                    daysbetween = 0
+                                    if startdate and enddate:
+                                        daysbetween = (enddate - startdate).days
+
+                                    if daysbetween > 0:
+
+                                        # calculamos el máximo número de días que te
+                                        # puede permitir elegir
+                                        days = range(1, daysbetween + 1)
+                                        for n in range(len(days)):
+                                            days[n] = str(days[n])
+
+                                        daystoapply = main.menu.getSelection(\
+                                        "Apply completely on how many days?", days)
+
+                                        redraw2()
+
+                                        if daystoapply and startdate and enddate and \
+                                        startdate <= enddate:
+                                            # hay que sumarle 10 para que no se confundan con los días
+                                            # de la semana
+                                            daystoapply = int(daystoapply) + 10
+                                            dfefuture = (startdate - datetime.utcfromtimestamp(0).date()).days
+
+                                            applyprogram = ""
+                                            applyprogram += str(dfefuture) + ":"
+                                            applyprogram += str(daystoapply) + ":"
+                                            applyprogram += str(Profiles.Default.brm) + ":"
+                                            applyprogram += str(Profiles.Default.brb) + ":"
+                                            applyprogram += str(Profiles.Default.lum) + ":"
+                                            applyprogram += str(Profiles.Default.lub) + ":"
+                                            applyprogram += str(Profiles.Default.dim) + ":"
+                                            applyprogram += str(Profiles.Default.dib)
+
+                                            # quitamos las fechas que pudiese haber y los gradual apply's
+                                            program = Profiles().deleteDatesFromProgram(program)
+                                            program = Profiles().deleteGradualApplyFromProgram(program)
+
+                                            if program:
+                                                program = str(startdate) + " " +\
+                                                 str(enddate) + " " + applyprogram + " "\
+                                                  + program
+                                            else:
+                                                program = str(startdate) + " " +\
+                                                 str(enddate) + " " + applyprogram
+
+                                elif answer == "Reconfigure days of gradual apply":
+                                    if ':' not in program:
+                                        main.menu.showMessage("Apply first a Gradual Apply", "error")
+                                    else:
+                                        gdfe, gdta, gbrm, gbrb, glum, glub, gdim, gdib = \
+                                        None, None, None, None, None, None, None, None
+
+                                        for pro in program.split(" "):
+                                            if ':' in pro:
+                                                gdfe, gdta, gbrm, gbrb, glum, glub, gdim, gdib =\
+                                                 pro.split(':')
+
+                                        if not gbrm:
+                                            gbrm = 0.0
+                                        if not gbrb:
+                                            gbrb = 0.0
+                                        if not glum:
+                                            glum = 0.0
+                                        if not glub:
+                                            glub = 0.0
+                                        if not gdim:
+                                            gdim = 0.0
+                                        if not gdib:
+                                            gdib = 0.0
+
+                                        startdate, enddate =\
+                                         Profiles().getDatesFromProgram(program)
+
+                                        daysbetween = None
+                                        if startdate and enddate:
+                                            daysbetween = (enddate - startdate).days
+                                        else:
+                                            daysbetween = (int(gdta) - 10) * 2
+
+                                        # calculamos el máximo número de días que te
+                                        # puede permitir elegir
+                                        days = range(1, daysbetween + 1)
+                                        for n in range(len(days)):
+                                            days[n] = str(days[n])
+
+                                        daystoapply = main.menu.getSelection(\
+                                        "Apply completely on how many days?", days)
+
+                                        redraw()
+
+                                        if daystoapply:
+                                            # hay que sumarle 10 para que no se confundan con los días
+                                            # de la semana
+                                            daystoapply = int(daystoapply) + 10
+
+                                            applyprogram = ""
+                                            applyprogram += gdfe + ":"
+                                            applyprogram += str(daystoapply) + ":"
+                                            applyprogram += gbrm + ":"
+                                            applyprogram += gbrb + ":"
+                                            applyprogram += glum + ":"
+                                            applyprogram += glub + ":"
+                                            applyprogram += gdim + ":"
+                                            applyprogram += gdib
+
+                                            # quitamos las fechas y graduals que pudiese haber
+                                            program = Profiles().deleteDatesFromProgram(program)
+                                            program = Profiles().deleteGradualApplyFromProgram(program)
+
+                                            if not startdate and not enddate:
+                                                if program:
+                                                    program = applyprogram + " " + program
+                                                else:
+                                                    program = applyprogram
+                                            else:
+                                                if program:
+                                                    program = str(startdate) + " " + str(enddate) + " " + applyprogram + " " + program
+                                                else:
+                                                    program = str(startdate) + " " + str(enddate) + " " + applyprogram
+
+
+
+                                elif answer == "Select a date":
+                                    startdate = main.menu.getDate("Start date", "Select a date in which the profile applies")
+                                    if startdate:
+
+                                        # quitamos las fechas y graduals que pudiese haber
+                                        program = Profiles().deleteDatesFromProgram(program)
+                                        program = Profiles().deleteGradualApplyFromProgram(program)
+
+                                        if program:
+                                            program = str(startdate) + " " + program
+                                        else:
+                                            program = str(startdate)
+
+                                elif answer == "Clean program":
+                                    program = ""
+
+                        elif pos == 3: # editamos brb
+                            answer = main.menu.getSelection("Select dose:",
+                                doserange, len(doserange) / 2)
+                            if answer:
+                                brb = float(answer)
+
+                        elif pos == 4: # editamos lub
+                            answer = main.menu.getSelection("Select dose:",
+                                doserange, len(doserange) / 2)
+                            if answer:
+                                lub = float(answer)
+
+                        elif pos == 5: # editamos dib
+                            answer = main.menu.getSelection("Select dose:",
+                                doserange, len(doserange) / 2)
+                            if answer:
+                                dib = float(answer)
+
+                    elif c == ord('f'): # guardamos el nuevo profile
+                        if pname:
+                            if not profile:
+                                profile = Profiles()
+                                profile.new(None, pname, ptype)
+                            else:
+                                profile.pname = pname
+                                profile.ptype = ptype
+
+
+                            if profile.ptype == Profiles.RELATIVE:
+                                profile.selected = False
+
+                            if ptype == Profiles.ABSOLUTE:
+                                profile.setParams(brm, brb, lum, lub, dim, dib)
+                            elif ptype == Profiles.RELATIVE:
+                                profile.setParams(brb, lub, dib)
+
+                            profile.setProgram(program)
+
+                            main.database.saveProfiles()
+                            Profiles.List = []
+                            main.database.loadProfiles()
+                        return
+
+
+            # reload profiles
+            def reloadp():
+                reloadp.abspnames = []
+                reloadp.relpnames = []
+
+                for profile in Profiles.List:
+                    if profile.ptype == Profiles.ABSOLUTE:
+                        reloadp.abspnames.append(profile.pname)
+
+                    elif profile.ptype == Profiles.RELATIVE:
+                        reloadp.relpnames.append(profile.pname)
+
+                reloadp.abspnames.sort()
+                reloadp.relpnames.sort()
+
+                reloadp.abspnameslen = len(reloadp.abspnames)
+                reloadp.relpnameslen = len(reloadp.relpnames)
+
+            def redraw():
+                footer = "SPACE - Select / a - Add / d -\
+ Delete / ENTER - Edit / ESC - Quit"
+                self.__set_principal_screen("Diabetpy Profile Editor", footer.center(maxx))
+
+                abswin.erase()
+                abswin.attron(curses.color_pair(2))
+                abswin.bkgd(" ", curses.color_pair(2))
+                abswin.box()
+                ti = " Absolute Profiles "
+                absmy, absmx = abswin.getmaxyx()
+                abswin.addstr(0, (absmx / 2) - (len(ti) / 2), ti, self.T)
+
+                relwin.erase()
+                relwin.attron(curses.color_pair(2))
+                relwin.bkgd(" ", curses.color_pair(2))
+                relwin.box()
+                ti = " Relative Profiles "
+                relmy, relmx = relwin.getmaxyx()
+                relwin.addstr(0, (relmx / 2) - (len(ti) / 2), ti, self.T)
+
+                for abspnamesn in range(len(reloadp.abspnames[abstopindex:absbottomindex])):
+                    pname = reloadp.abspnames[abspnamesn + abstopindex]
+
+                    s = self.N
+                    ck = "[ ] "
+
+                    if abspnamesn == abspos and absview:
+                        s = self.H
+
+                    if pname == Profiles.Selected.pname:
+                        ck = "[x] "
+
+                    l = ck + pname
+                    abswin.addstr(abspnamesn + 1, 1,
+                        l[0:(width - 2)].ljust(width - 2), s)
+
+                for relpnamesn in range(len(reloadp.relpnames[reltopindex:relbottomindex])):
+                    pname = reloadp.relpnames[relpnamesn + reltopindex]
+
+                    s = self.N
+                    if relpnamesn == relpos and relview:
+                        s = self.H
+
+                    relwin.addstr(relpnamesn + 1, 1,
+                        pname[0:(width - 2)].ljust(width - 2), s)
+
+                abswin.refresh()
+                relwin.refresh()
+                self.SC.refresh()
+
+                return
+
+            reloadp()
+            redraw()
+
+            curses.flushinp()
+            c = self.SC.getch()
+
+            if c == curses.KEY_DOWN:
+                if absview:
+                    if abspos != height - 3 and abspos < reloadp.abspnameslen - 1:
+                        abspos += 1
+
+                    elif abspos == height - 3 and abspos < reloadp.abspnameslen - 1 and \
+                    reloadp.abspnames[absbottomindex:absbottomindex + 1]:
+                        abstopindex += 1
+                        absbottomindex += 1
+                else: # relative view
+                    if relpos != height - 3 and relpos < reloadp.relpnameslen - 1:
+                        relpos += 1
+
+                    elif relpos == height - 3 and relpos < reloadp.relpnameslen - 1 and \
+                    reloadp.relpnames[relbottomindex:relbottomindex + 1]:
+                        reltopindex += 1
+                        relbottomindex += 1
+
+            elif c == curses.KEY_UP:
+                if absview:
+                    if abspos == 0 and abspos < abstopindex:
+                        abstopindex -= 1
+                        absbottomindex -= 1
+
+                    elif abspos > 0:
+                        abspos -= 1
+                else:
+                    if relpos == 0 and relpos < reltopindex:
+                        reltopindex -= 1
+                        relbottomindex -= 1
+
+                    elif relpos > 0:
+                        relpos -= 1
+
+            # add profile
+            elif c == ord('a'):
+                runEditAddProfile()
+                reloadp()
+
+            # edit a profile
+            elif c == ord('\n'):
+                profile = None
+                if absview:
+                    name = reloadp.abspnames[abspos + abstopindex]
+                    profile = Profiles().getProfileByName(name)
+                elif relview:
+                    name = reloadp.relpnames[relpos + reltopindex]
+                    profile = Profiles().getProfileByName(name)
+
+                #main.menu.runEditAddProfile(profile)
+                runEditAddProfile(profile)
+                reloadp()
+
+
+            # delecte a profile
+            elif c == ord('d'):
+                profile = None
+                if absview:
+                    name = reloadp.abspnames[abspos + abstopindex]
+                    profile = Profiles().getProfileByName(name)
+                elif relview:
+                    name = reloadp.relpnames[relpos + reltopindex]
+                    profile = Profiles().getProfileByName(name)
+
+                if profile.pname != 'Default':
+                    answer = main.menu.getYesNo("Delete profile?")
+                    if answer:
+                        if profile.selected:
+                            Profiles.Default.setSelected()
+                            main.database.saveProfiles()
+                        profile.remove()
+                        reloadp()
+                        abspos = 0
+                        relpos = 0
+
+            # change between views
+            elif c == ord('\t'):
+                if absview and reloadp.relpnameslen:
+                    absview = False
+                    relview = True
+                else:
+                    absview = True
+                    relview = False
+
+            elif c == curses.KEY_LEFT:
+                absview = True
+                relview = False
+
+            elif c == curses.KEY_RIGHT and reloadp.relpnameslen:
+                absview = False
+                relview = True
+
+            elif c == ord(' ') and absview:
+                # hay que escribir desde aquí
+                # tiene que permitirnos seleccionar el número de días
+                # que quieres para que el cambio se complete del todo
+                name = reloadp.abspnames[abspos + abstopindex]
+                profile = Profiles().getProfileByName(name)
+                profile.setSelected()
+                main.database.saveProfiles()
+
+
+        # Calculamos parámetros por si algún perfil aplica ya
+        Profiles().calculateParams()
+
+    def run(self):
+        self.__set_principal_screen(self.APPTITLE)
+
+
+        # detectamos la línea más larga de las opciones
+        maxline = 30
+        option_count = len(self.MENU)
+
+        for a in range(option_count):
+            if len(self.MENU[a]['title']) > maxline:
+                maxline = len(self.MENU[a]['title'])
+        title = ""
+
+        try:
+            title = self.PARENTMENU[-1][self.OLDPOS[-1]]['title']
+            if title[-1] == '>':
+                title = title[0:-2]
+                title = " " + title + " "
+        except:
+            title = " Main menu "
+        if len(title) > maxline:
+            maxline = len(title)
+
+        maxy, maxx = self.SC.getmaxyx()
+
+        menuwin = self.SC.subwin(option_count + 2, maxline + 4,
+            (maxy / 2) - (option_count / 2) - 1,
+            ((maxx / 2) - (maxline / 2)) - 2)
+
+        my, mx = menuwin.getmaxyx()
+
+        def checkDate(datetocheck):
+            """
+            Checkea si una fecha está en:
+            -1 en el pasado
+            0 es la fecha actual
+            1 está en el futuro
+            """
+            if not datetocheck:
+                return False
+
+            answer = None
+            diff = datetocheck - date.today()
+            if diff.days < 0:
+                return -1
+            elif diff.days == 0:
+                return 0
+            else:
+                return 1
+
+        def redraw():
+
+            try:
+                foo = self.MENU[self.POS]['footer']
+            except:
+                foo = ""
+            self.__setFooter(foo)
+
+            menuwin.bkgd(" ", curses.color_pair(2))
+            menuwin.border()
+
+
+            menuwin.addstr(0, (mx / 2) - len(title) / 2, title, self.T)
+            # options
+            for index in range(option_count):
+                t = self.MENU[index]['title']
+                s = self.N
+                if index == self.POS:
+                    s = self.H
+                if t == "-":
+                    menuwin.hline(index + 1, 1, curses.ACS_HLINE, mx - 2)
+                else:
+                    menuwin.addstr(index + 1, 1, t.ljust(mx - 2), s)
+            self.SC.refresh()
+            menuwin.refresh()
+
+
+        c = None
+        while c != ord('\n'):
+
+            redraw()
+
+            curses.flushinp()
+            c = self.SC.getch()
+
+            if c == curses.KEY_DOWN:
+                if self.POS < option_count - 1:
+                    self.POS += 1
+                    while self.MENU[self.POS]['title'] == '-':
+                        self.POS += 1
+                else:
+                    self.POS = 0
+
+            elif c == curses.KEY_UP:
+                if self.POS > 0:
+                    self.POS -= 1
+                    while self.MENU[self.POS]['title'] == '-':
+                        self.POS -= 1
+                else:
+                    self.POS = option_count - 1
+
+            elif c == ord('c'):
+                Profiles().calculateParams()
+
+            elif c == 27:  # ESC
+                self.POS = option_count - 1
+                break
+
+        """
+        A partir de aquí procesamos la selección
+        Se ha decidido meter el getchoice y el process choice en un
+        mismo método por la función redraw().
+        """
+        choice = self.POS
+
+        ti = main.menu.MENU[choice]['title']
+        ty = main.menu.MENU[choice]['type']
+        op = main.menu.MENU[choice]['options']
+
+        if ty == "EXIT": main.bye = True
+        elif ty == "MENU": main.menu.goMenu(op)
+        elif ty == "BACK": main.menu.goBack()
+
+        elif ty == "MEAL_MENU":  # menú de comidas
+            meal = op
+            mcar = main.database.getMiddleCarbh(meal)
+            carb, txtm, genr = main.menu.runMealMenu(meal, mcar)
+
+            if carb:
+                if meal == "complex food":
+                    grs = main.menu.getData("Total weight(in gr):",
+                        "integer")
+
+                    fname = main.menu.getData("Name of the complex food:")
+
+                    isfree = Food().isFNameFree(fname.capitalize())
+
+                    perc = 100 / (grs / float(carb))
+
+                    if grs > carb and fname and isfree and perc < 100:
+
+                        food = Food()
+                        food.add(fname.capitalize(), Food.COMPLEXFOOD, perc)
+                        main.database.saveFood()
+                        main.menu.goMain()
+
+                else:
+                    if genr:
+                        m, b = Profiles().getParamsByMeal(meal)
+                        if m:
+                            dose = Profiles().getDose(carb, meal)
+
+                            m, b = Profiles().getParamsByMeal(meal)
+                            md5sum = md5.new(str(m) + '/' + str(b)).hexdigest()
+
+                            main.database.insertMeal(meal, carb, dose,
+                                txtm, md5sum)
+                            main.menu.showMessage("Recommended dose: "\
+                            + str(int(round(dose))))
+
+                            main.menu.goMain()
+
+                        else:
+                            main.menu.showMessage(\
+                                "There are insuficient data")
+                            dose = main.menu.getData("New dose:", "integer")
+                            if dose:
+                                main.database.insertMeal(meal, carb, dose, txtm, "")
+                                main.database.calculateParamsFromDatabase()
+                                main.menu.goMain()
+
+                    else:
+                        main.database.insertMeal(meal, carb, 0, txtm)
+
+        # para modificar recomendaciones
+        elif ty == "MODIFY_MENU":
+            meal = op.split('-')[0]
+            operation = op.split('-')[1]
+
+            iddb, carb, dose, txtm, md5sum = main.database.getLastRecommendation(meal)
+
+            if not iddb:
+                main.menu.showMessage("There is no annotation yet",
+                    "error")
+
+            else:
+                sp = Profiles.Selected
+                m, b = Profiles().getParamsByMeal(meal)
+                md5sumnow = md5.new(str(m) + '/' + str(b)).hexdigest()
+                # md5sum y md5sumnow tienen que ser iguales porque si no,
+                # la recomendación se realizó con funciones distintas de
+                # las que se van a modificar.
+
+                if ':' in sp.program:
+                    main.menu.showMessage(\
+                    "Gradual Apply is programmed in " + sp.pname + " profile. \
+Clean the program or reconfigure it to be done in more or less days", "error")
+
+                else:
+                    if md5sumnow != md5sum:
+                        main.menu.showMessage(\
+                        "The last recommendation was made with other function that the " + sp.pname + " profile has. \
+Try first taking a meal with actual profile or change the profile to the other used for that meal.", "error")
+                    else:
+
+                        main.menu.showMessage(meal.capitalize() +\
+                        " last recomendation: " + txtm + \
+                        "/ Total carbonhydrates: " + str(int(round(carb))) + \
+                        "gr; Dose: " + str(int(round(dose))))
+
+
+                        # se setea a True para que pase el if de más abajo si no
+                        # hemos seleccionado "fix" como operación.
+                        carbfixed = True
+
+                        redraw()
+
+                        if m and b and operation[1:4] == "fix":
+                            """
+                            Hacemos una lista de elementos de 5 en 5 de 20 a 120
+                            """
+                            a = []
+                            for x in range(20, 121, 5): a.append(str(x))
+                            carbfixed = main.menu.getSelection("Fixed carbonhydrates:", a)
+                            operation = operation[0:1] + str(carbfixed)
+
+                        redraw()
+                        newd = main.menu.getData("New dose:", "integer")
+                        redraw()
+
+                        if newd and carbfixed and round(dose) != newd:
+                            ok = False
+                            ok2 = False
+
+                            if m:
+                                ok = Profiles().modifyFunction(carb, newd, meal, operation)
+
+                            if not ok:
+                                main.menu.showMessage(\
+                                "The slope has a negative sign. Try modifying by its index.",
+                                "error")
+                            else:
+                                m, b = Profiles().getParamsByMeal(meal)
+                                md5sumnow = md5.new(str(m) + '/' + str(b)).hexdigest()
+                                ok2 = main.database.modifyAnnotationById(iddb, newd, md5sumnow)
+
+                            if ok and ok2:
+                                main.menu.showMessage("Modified correctly")
+                                main.menu.goMain()
+                            else:
+                                main.menu.showMessage("Error modifying data",
+                                    "error")
+
+                        else:
+                            main.menu.showMessage("No changes made")
+
+        elif ty == "CHARTS":
+            if gplot:
+                if op == "drawfunctions":
+                    # creamos el listado de seleccion
+                    # la primera opción es los parametros que se aplican
+                    # pueden ser el resultado de Default + algún relativo
+                    selecs = [Profiles.ProfilesAppliedStr, "-"]
+                    for profile in Profiles.List:
+                        if profile.ptype == Profiles.ABSOLUTE:
+                            selecs.append(profile.pname)
+                    sel = main.menu.getSelection("What do you want to plot?", selecs)
+
+                    name, bm, bb, lm, lb, dm, db = None, None, None, None, None, None, None
+                    gplotbuffer = None
+
+                    if sel:
+
+                        if sel == Profiles.ProfilesAppliedStr:
+
+                            name, bm, bb, lm, lb, dm, db = Profiles.ProfilesAppliedStr,\
+                            Profiles.Bm, Profiles.Bb, Profiles.Lm, Profiles.Lb,\
+                            Profiles.Dm, Profiles.Db
+
+                            gplotbuffer = main.database.getGplotBufferForFunctions(\
+                            name, bm, bb, lm, lb, dm, db)
+
+                        else:
+                            p = Profiles().getProfileByName(sel)
+                            name, bm, bb, lm, lb, dm, db = p.pname, p.brm, p.brb,\
+                            p.lum, p.lub, p.dim, p.dib
+
+                            gplotbuffer = main.database.getGplotBufferForFunctions(\
+                            name, bm, bb, lm, lb, dm, db)
+
+                        if not gplotbuffer:
+                                main.menu.showMessage(
+                                "There is nothing to plot here yet.", "error")
+                        else:
+                            gp = Gnuplot.Gnuplot()
+                            gp(gplotbuffer)
+                else:
+                    begindate = date.today()
+                    gplotbuffer = None
+
+                    # cogemos una fecha en el pasado
+                    while begindate and checkDate(begindate) >= 0:
+                        begindate = main.menu.getDate(
+                            "Select date",
+                            "Select date from which data will be retrieved to plot")
+                        if begindate and checkDate(begindate) >= 0:
+                            #redraw()
+                            main.menu.showMessage(
+                            "Date must be in the past", "error")
+
+                    # general view
+                    if op == "gv" and begindate:
+                        gplotbuffer = \
+                        main.database.getGplotBufferForGeneralView(begindate)
+
+                    # day view
+                    elif op == "dv" and begindate:
+                        gplotbuffer = \
+                        main.database.getGplotBufferForDayView(begindate)
+
+                    # intake view
+                    elif op.split('-')[0] == "iv" and begindate:
+                        meal = op.split('-')[1]
+                        gplotbuffer = \
+                        main.database.getGplotBufferForIntakeView(begindate,
+                         meal)
+
+                    if gplotbuffer:
+                        gp = Gnuplot.Gnuplot()
+                        gp(gplotbuffer)
+                    else:
+                        main.menu.showMessage("There's not enough information to plot",
+                        "error")
+
+            else:
+                main.menu.showMessage("Module Gnuplot for python not found", "error")
+
+        elif ty == "ACTION":
+            if op == "glycemy":
+                opts = [\
+                "Before breakfast",
+                "After breakfast",
+                "-",
+                "Before lunch",
+                "After lunch",
+                "-",
+                "Before dinner",
+                "After dinner",
+                "-",
+                "In the night"\
+                ]
+                selec = main.menu.getSelection("Which moment?", opts)
+                if selec == "Before breakfast": op = "bb"
+                elif selec == "After breakfast": op = "ab"
+                elif selec == "Before lunch": op = "bl"
+                elif selec == "After lunch": op = "al"
+                elif selec == "Before dinner": op = "bd"
+                elif selec == "After dinner": op = "ab"
+                elif selec == "In the night": op = "in"
+
+                g = None
+                if selec:
+                    g = main.menu.getData("Glycemy level:", "integer")
+                redraw()
+                if g:
+                    main.database.insertGlycemy(op, g)
+                    main.menu.showMessage(\
+                        "Glycemy level added to database")
+                    main.menu.goMain()
+
+            elif op == "deletemeal":
+                main.menu.runDatabase()
+
+            elif op == "deletelastglycemy":
+                answer = main.menu.getYesNo(\
+                    "Delete last record on glycemys?")
+                redraw()
+                if answer:
+                    main.database.deleteLastGlycemy()
+                    main.menu.showMessage(\
+                        "Glycemy record deleted succesfuly")
+
+            elif op == "dbvacuum":
+                main.database.doVacuum()
+                main.menu.showMessage("VACUUM done")
+
+            elif op == "profiles":
+                main.menu.runProfiles()
+
+    def showMessage(self, msg, msgtype="info"):
+        # con este código dividimos msg en fragmentos de 40 caracteres
+        # más o menos, que se almacenan en la lista s.
+        s = [""]
+        maxsl = 0
+        for c in msg:
+            s[-1] += c
+            l = len(s[-1])
+            if l > maxsl:
+                maxsl = l
+            if l > 40 and c == " ":
+                s.append("")
+        # creamos una ventana a medida.
+        maxy, maxx = self.SC.getmaxyx()
+        msgwin = self.SC.subwin(2 + len(s), maxsl + 2,
+             maxy - 6 - len(s), (maxx / 2) - ((maxsl + 2) / 2))
+
+        msgwin.erase()
+        msgwin.attron(curses.color_pair(2))
+        msgwin.bkgd(" ", curses.color_pair(2))
+        msgwin.box()
+
+        # Escribimos info o error, dependiendo del tipo de mensaje
+        if msgtype == "error":
+            msgwin.addstr(0, 2, " Error ", self.ER)
+        elif msgtype == "info":
+            msgwin.addstr(0, 2, " Info ", self.T)
+
+        # Escribimos el mensaje preparado con cada linea centrada
+        for i in range(len(s)):
+            msgwin.addstr(1 + i, ((maxsl + 2) // 2) - (len(s[i]) // 2),
+                s[i])
+
+        # actualizamos ventana
+        msgwin.refresh()
+        c = None
+        while c == None:
+            c = self.SC.getch()
+        msgwin.erase()
+        msgwin.attron(curses.color_pair(5))
+        msgwin.bkgd(" ", curses.color_pair(5))
+        msgwin.noutrefresh()
+
+    def getSelection(self, title, options, pos = 0):
+        """
+        title is the title of the list used
+        options is a list of possible options to select
+        pos is the default selection
+        """
+        title = " " + title[0:72] + " "
+        returnvalue = True
+
+        # determinamos el tamaño necesario para crear la ventana
+        # minimo 30 de ancho
+        width = 30
+        if len(title) > 30:
+            width = len(title) + 2
+
+        for opt in options:
+            if len(opt) > width:
+                width = len(opt) + 2
+
+        maxy, maxx = self.SC.getmaxyx()
+        numopt = len(options)
+        height = 0
+
+        if numopt > 10:
+            height = 12
+        else:
+            height = numopt + 2
+
+        # creamos la ventana
+        selwin = self.SC.subwin(height, width,
+            (maxy / 2) - (height / 2), (maxx / 2) - (width / 2))
+
+        selmy, selmx = selwin.getmaxyx()
+
+        selwin.attron(curses.color_pair(2))
+        selwin.bkgd(" ", curses.color_pair(2))
+        selwin.box()
+        selwin.addstr(0, (width / 2) - len(title) / 2, title,
+            self.T)
+
+        topindex = 0
+        bottomindex = height - 2
+
+        # Si hemos seleccionado una posición inicial que se encuentra mucho más
+        # abajo en una lista de selección larga este código centra la vista, dejando con
+        # la region topindex y bottomindex, "pos" lo más al centro posible.
+        newpos = pos
+        while (pos > (topindex + bottomindex) / 2 or pos > bottomindex) and options[bottomindex:bottomindex + 1]:
+            topindex += 1
+            bottomindex += 1
+            newpos -= 1
+        pos = newpos
+
+        c = None
+        while c != ord('\n'):
+            for nopt in range(len(options[topindex:bottomindex])):
+                option = options[nopt + topindex]
+                s = self.N
+                if nopt == pos:
+                    s = self.H
+
+                if option == "-":
+                    selwin.hline(nopt + 1, 1, curses.ACS_HLINE, selmx - 2)
+                else:
+                    selwin.addstr(nopt + 1, 1,
+                    option[0:(width - 2)].ljust(width - 2), s)
+
+            selwin.refresh()
+            curses.flushinp()
+            c = self.SC.getch()
+
+            if c == curses.KEY_DOWN:
+                if pos != height - 3 and pos < numopt - 1:
+                    pos += 1
+                    while options[pos + topindex] == '-':
+                        pos += 1
+
+                elif pos == height - 3 and pos < numopt - 1 and \
+                options[bottomindex:bottomindex + 1]:
+                    topindex += 1
+                    bottomindex += 1
+                    while options[pos + topindex] == '-':
+                        topindex += 1
+                        bottomindex += 1
+
+            elif c == curses.KEY_UP:
+                if pos == 0 and pos < topindex:
+                    topindex -= 1
+                    bottomindex -= 1
+                    while options[pos + topindex] == '-':
+                        topindex -= 1
+                        bottomindex -= 1
+
+                elif pos > 0:
+                    pos -= 1
+                    while options[pos + topindex] == '-':
+                        pos -= 1
+
+            elif c == 27:  # ESC
+                pos = numopt - 1
+                returnvalue = False
+                break
+
+        if returnvalue:
+            return options[pos + topindex]
+        else:
+            return False
+
+    def getYesNo(self, question = "Are you sure?"):
+        answer = self.getSelection(question, ["Yes", "No"], 1)
+        if answer == "Yes":
+            return True
+        else:
+            return False
+
+
+    def getData(self, msg, dattype="string"):
+        # Dattype es integer, float o string
+
+        xsize = len(msg) + 4
+        if xsize < 30:
+            xsize = 30
+
+        back = None
+        maxy, maxx = self.SC.getmaxyx()
+        while not back:
+            msgwin = self.SC.subwin(3, xsize + 2,
+                 maxy - 7, (maxx / 2) - ((xsize + 2) // 2))
+            msgwin.attron(curses.color_pair(2))
+            msgwin.bkgd(" ", curses.color_pair(2))
+            msgwin.box()
+            msgwin.addstr(0, 2, " " + msg + " ", self.T)
+            msgwin.refresh()
+            txtwin = msgwin.subwin(1, xsize,
+                 maxy - 6, ((maxx / 2) - ((xsize + 2) // 2)) + 1)
+            txtwin.keypad(1)
+            txtwin.erase()
+            txtwin.refresh()
+            tb = curses.textpad.Textbox(txtwin)
+            curses.flushinp()
+            dat = tb.edit()
+            msgwin.erase()
+            msgwin.refresh()
+
+            if not dat:
+                back = True
+            elif dattype == "integer":
+                try:
+                    dat = int(dat)
+                    if dat < 100000:
+                        back = True
+                except:
+                    continue
+            elif dattype == "float":
+                try:
+                    dat = float(dat)
+                    if dat < 100000:
+                        back = True
+                except:
+                    continue
+            else:
+                if dat[-1] == " ":  # quitamos espacio final
+                    dat = dat[:-1]
+                back = True
+
+        msgwin.attron(curses.color_pair(5))
+        msgwin.bkgd(" ", curses.color_pair(5))
+        msgwin.noutrefresh()
+        msgwin.erase()
+        return dat
+
+    def getDate(self, title, footer = ""):
+        """
+        Abre una ventana para seleccionar una fecha cualquiera
+        retorna un objeto "date" con la fecha seleccionada
+        """
+        #self.__set_principal_screen(title, footer)
+        self.__setFooter(footer)
+        self.__setTitle(title)
+
+        maxy, maxx = self.SC.getmaxyx()
+
+        ahora = datetime.now()
+
+        # las variables "today" es para iluminar en el calendario el día actual
+        year = todayyear = ahora.year
+        month = todaymonth = ahora.month
+        pos = todayday = ahora.day
+
+        # creamos la ventana
+        height = 9
+        width = 29
+
+        calwin = self.SC.subwin(height, width,
+        maxy - height - 3, maxx - width - 2)
+
+        c = None
+        while c != ord('\n'):
+            # Generamos el calendario y lo dibujamos
+
+            monthweeks = [{}] # es una lista de diccionarios
+            # Se hace para que cada elemento de la lista se corresponda
+            # con las semanas, y cada semana que sea un diccionario cuyas
+            # claves van del 0 - 6, lunes a domingo, y los valores los días
+            # por ejem. {'0': "13"} sería un lunes día 13.
+
+            # título con mes en letras y año
+            datetitle = " " + date(year, month, pos).strftime("%B") + " " + str(year) + " "
+
+            # sacamos los días que tiene el mes para dibujar
+            numberofdaysonmonth = monthrange(year, month)[1]
+
+            # ubicamos cada día dependiendo del día de la semana que es
+            # en la estructura de datos monthweeks
+            for d in range(1, numberofdaysonmonth + 1):
+                wd = date(year, month, d).weekday()
+                monthweeks[-1][str(wd)] = d
+                if wd == 6:
+                    monthweeks.append({})
+
+            # borramos la ventana e inicializamos su apariencia
+            calwin.erase()
+            calwin.attron(curses.color_pair(2))
+            calwin.bkgd(" ", curses.color_pair(2))
+            calwin.box()
+
+            # escribimos el titulo y el encabezado
+            calwin.addstr(0, (width / 2) - (len(datetitle) / 2), datetitle, self.T)
+            calwin.addstr(1, 1, "Mon Tue Wen Thu Fri Sat Sun", self.N)
+
+            x = None
+            y = 1
+
+            # para meses con días esparcidos por menos de 6 semanas, y = 2
+            if(len(monthweeks) < 6):
+                y = 2
+
+            for w in monthweeks:
+                y += 1
+                for d in w:
+                    s = self.N
+                    if w[d] == todayday and month == todaymonth and year == todayyear:
+                        s = self.T
+
+                    if w[d] == pos:
+                        s = self.H
+
+                    x = (int(d) * 4) + 1
+                    calwin.addstr(y, x, str(w[d]).rjust(3), s)
+
+            # aquí el calendario está terminado y se muestra en pantalla
+            calwin.refresh()
+
+            # capturamos la entrada
+            curses.flushinp()
+            c = self.SC.getch()
+
+            dst = None
+
+            # arriba y abajo suman o restan 7 días
+            if c == curses.KEY_DOWN:
+                dst = date(year, month, pos) + timedelta(days=7)
+
+            elif c == curses.KEY_UP:
+                dst = date(year, month, pos) - timedelta(days=7)
+
+            # izquierda y derecha restan o suman 1 día
+            elif c == curses.KEY_LEFT:
+                dst = date(year, month, pos) - timedelta(days=1)
+
+            elif c == curses.KEY_RIGHT:
+                dst = date(year, month, pos) + timedelta(days=1)
+
+            elif c == 27:  # ESC
+                return None
+
+            # Si existe dst actualizamos las variables con la nueva posición
+            if dst:
+                year = dst.year
+                month = dst.month
+                pos = dst.day
+
+        # retornamos el objeto date con la fecha seleccionada
+        return date(year, month, pos)
+
+    def runMealMenu(self, meal, middle_carbh):
+        maxy, maxx = self.SC.getmaxyx()
+
+        self.__set_principal_screen(meal.capitalize().center(maxx))
+
+        # cargamos los alimentos
+        main.database.loadFood()
+
+        foodwin = self.SC.subwin(maxy - 6, maxx / 2 - 4, 3, 2)
+        foodwin.keypad(1)
+
+        mealwin = self.SC.subwin(maxy - 15, maxx / 2 - 3, 3, (maxx / 2) + 1)
+
+        legendwin = self.SC.subwin(8, maxx / 2 - 3, maxy - 11, maxx / 2 + 1)
+
+
+        carbhydr = 0
+        carbls = []
+
+        ftype = Food.FOOD
+        ftypesel = [Food.FOOD, Food.COMPLEXFOOD, Food.FAVORITE]
+
+        FL = Food().getListNamesSortedByType(ftype)
+
+        foodmaxy, foodmaxx = foodwin.getmaxyx()
+        foodmaxy -= 2
+
+        mealmaxy, mealmaxx = mealwin.getmaxyx()
+
+        topindex = 0
+        bottomindex = foodmaxy
+        pos = 0
+
+        modified = None
+
+        c = None
+        meal_list = []
+
+        while True:
+
+            def redraw():
+
+
+                carbhydr = 0
+                for c in carbls:
+                    carbhydr += c
+
+                footer = ""
+                if ftype == Food.FOOD and not FL:
+                    footer += "Start adding food with 'a' key"
+                else:
+                    footer += "Profile Applied: " + Profiles.ProfilesAppliedStr
+                    dos = None
+                    if meal == "breakfast" or meal == "dinner" or meal == "lunch":
+                        dos = Profiles().getDose(carbhydr, meal)
+                    if dos > 0 and carbhydr:
+                        footer += " / "
+                        footer += "Dose: " + str(round(dos, 1))
+
+                self.__setFooter(footer)
+
+
+                redraw.option_count = 0
+
+                foodwin.erase()
+                foodwin.attron(curses.color_pair(2))
+                foodwin.bkgd(" ", curses.color_pair(2))
+                foodwin.box()
+
+                mealwin.attron(curses.color_pair(2))
+                mealwin.bkgd(" ", curses.color_pair(2))
+                mealwin.box()
+
+                legendwin.attron(curses.color_pair(2))
+                legendwin.bkgd(" ", curses.color_pair(2))
+                legendwin.box()
+
+
+                t = ""
+                if Food.FAVORITE in ftype:
+                    t = " Favorites "
+                elif Food.FOOD in ftype:
+                    t = " Food "
+                elif Food.COMPLEXFOOD in ftype:
+                    t = " Complex food "
+
+                foodwin.addstr(0, 1, t, self.T)
+                foodwin.addstr(0, foodmaxx - len(" Carb. Percent ") - 1, " Carb. Percent ", self.T)
+
+                mealwin.addstr(0, (mealmaxx/2) - (len(" List of selected food ")/2),
+                " List of selected food ", self.T)
+                legendwin.addstr(0, (mealmaxx/2) - (len(" Legend ") / 2),
+                " Legend ", self.T)
+
+                mealinfo = "Total: " + str(round(carbhydr, 1)) + "gr"
+
+                if middle_carbh > 0:
+                    mealinfo += " / Average: " + str(round(middle_carbh, 1)) + "gr"
+
+                mealinfo = " " + mealinfo + " "
+
+                mealwin.addstr(mealmaxy - 1, (mealmaxx / 2) - (len(mealinfo) / 2), mealinfo, curses.A_BOLD)
+
+
+                legendwin.addstr(1, 2,
+                    "up/down/tab / Navigate the menu")
+                legendwin.addstr(2, 2,
+                    "a/d/e / Add, delete, edit food")
+                legendwin.addstr(3, 2,
+                    "F/U / Favorite/Unfavorite food")
+                legendwin.addstr(4, 2,
+                    "enter/D / Select/Delete selected")
+                legendwin.addstr(5, 2,
+                    "f / Finish selecting food")
+                legendwin.addstr(6, 2,
+                    "esc / Quits this menu")
+                legendwin.refresh()
+
+
+                for food in FL[topindex:bottomindex]:
+                    s = self.N
+                    if redraw.option_count == pos:
+                        s = self.H
+                    if len(food) > foodmaxx - 8:
+                        foodwin.addstr(1 + redraw.option_count, 1, (food[0:foodmaxx - 8] + "...").ljust(foodmaxx - 5),
+                            s)
+                    else:
+                        foodwin.addstr(1 + redraw.option_count, 1, food.ljust(foodmaxx - 2), s)
+
+                    cp = Food().getCPercentByFName(food)
+
+                    if cp < 10:
+                        foodwin.addstr(1 + redraw.option_count, foodmaxx - 4, str(round(cp, 1)),
+                            s)
+                    else:
+                        foodwin.addstr(1 + redraw.option_count, foodmaxx - 5, str(round(cp, 1)),
+                            s)
+
+                    redraw.option_count += 1
+
+                m_index = 1
+                for m in meal_list[0:mealmaxy - 3]:
+                    graminfo = None
+                    mealfood = None
+                    if len(m) > mealmaxx - 2:
+                        graminfo = "(" + m.split('(')[-1]
+                        mealfood = m[0:mealmaxx - 5 - len(graminfo)] + "..." + graminfo
+                    else:
+                        mealfood = m
+
+                    mealwin.addstr(m_index, 1, mealfood, self.N)
+                    m_index += 1
+
+                if len(meal_list) > mealmaxy - 3:
+                    mealwin.addstr(m_index, 1, "More ...", self.N)
+
+                foodwin.refresh()
+                mealwin.refresh()
+                legendwin.refresh()
+
+
+            redraw()
+            option_count = redraw.option_count
+            option_count -= 1
+
+            curses.flushinp()
+            c = foodwin.getch()
+
+            if c == curses.KEY_DOWN:
+                if pos == option_count and pos < foodmaxy and \
+                    FL[bottomindex:bottomindex + 1]:
+
+                    topindex += 1
+                    bottomindex += 1
+
+                elif pos < option_count:
+                    pos += 1
+
+            elif c == curses.KEY_UP:
+                if pos == 0 and pos < topindex:
+                    topindex -= 1
+                    bottomindex -= 1
+                elif pos > 0:
+                    pos -= 1
+
+            elif c == curses.KEY_LEFT:
+                typepos = ftypesel.index(ftype)
+                if typepos > 0:
+                    typepos -= 1
+                    ftype = ftypesel[typepos]
+                    FL = Food().getListNamesSortedByType(ftype)
+
+                    topindex = 0
+                    bottomindex = foodmaxy
+                    pos = 0
+
+            elif c == curses.KEY_RIGHT:
+                typepos = ftypesel.index(ftype)
+                if typepos < 2:
+                    typepos += 1
+                    ftype = ftypesel[typepos]
+                    FL = Food().getListNamesSortedByType(ftype)
+
+                    topindex = 0
+                    bottomindex = foodmaxy
+                    pos = 0
+
+            elif c == ord('\t'):
+                typepos = ftypesel.index(ftype)
+                if typepos == 2:
+                    typepos = 0
+                else:
+                    typepos += 1
+
+                ftype = ftypesel[typepos]
+                FL = Food().getListNamesSortedByType(ftype)
+
+                topindex = 0
+                bottomindex = foodmaxy
+                pos = 0
+
+            elif c == ord('\n'):
+                fo = FL[pos + topindex]
+                if len(fo) > 30:
+                    fo = fo[0:27] + "..."
+                grams = self.getData(
+                    "Amount in grams of " + fo, "integer")
+                redraw()
+                if grams:
+                    addedfood = FL[pos + topindex]
+                    cpercent = Food().getCPercentByFName(addedfood)
+                    graminfo = "(" + str(grams) + "gr)"
+
+                    meal_list.append(addedfood + graminfo)
+                    carbls.append((cpercent / 100) * grams)
+
+            elif c == ord('D'):
+                if carbls and meal_list:
+                    answer = main.menu.getYesNo("Delete last food selected?")
+                    if answer:
+                        carbls.pop()
+                        meal_list.pop()
+                        self.__set_principal_screen(meal.capitalize().center(maxx))
+                        redraw()
+
+            elif c == ord('e'):
+                carbhydrperc = self.getData("New carbonhydrate percent:",
+                    "float")
+                redraw()
+                if carbhydrperc:
+                    carbhydrperc = round(carbhydrperc, 1)
+                    Food().setCPercentByName(FL[pos + topindex], carbhydrperc)
+                    foodwin.clear()
+                    foodwin.box()
+                    modified = True
+                    FL = Food().getListNamesSortedByType(ftype)
+                else:
+                    self.showMessage("No input data.", "error")
+
+            elif c == ord('a'):
+                newfood = self.getData("Food name:").capitalize()
+                isfree = Food().isFNameFree(newfood)
+                redraw()
+                if newfood and isfree:
+                    carbhydrperc = self.getData("Carbonhydrate percent:",
+                    "float")
+                    redraw()
+                    if carbhydrperc and carbhydrperc >= 0 and \
+                        carbhydrperc < 100:
+
+                        nf = Food()
+                        nf.add(newfood, Food.FOOD, carbhydrperc)
+                        option_count += 1
+
+                        foodwin.erase()
+                        foodwin.box()
+                        foodwin.refresh()
+                        modified = True
+                        FL = Food().getListNamesSortedByType(ftype)
+                    else:
+                        self.showMessage(
+                        "Error. Porcentage must be between 0.1 and 99.9.",
+                        "error")
+
+                else:
+                    self.showMessage("No name given or name repeated.", "error")
+
+            elif c == ord('d'):
+                food = Food().getFoodObjectByName(FL[pos + topindex])
+                answer = main.menu.getYesNo("Delete food?")
+                self.__set_principal_screen(meal.capitalize().center(maxx))
+                if answer:
+                    if food.fid:
+                        Food.FidsToDelete.append(food.fid)
+                    Food().deleteByName(food.fname)
+
+                    if pos + topindex + 1 == len(FL):
+                        pos -= 1
+
+                    foodwin.erase()
+                    foodwin.box()
+                    foodwin.refresh()
+                    FL = Food().getListNamesSortedByType(ftype)
+                    modified = True
+
+            elif c == ord('F'):
+                allok = Food().favoriteFoodByName(FL[pos + topindex])
+                if allok:
+                    main.menu.showMessage("Food " + FL[pos + topindex] + " favorited")
+                    foodwin.erase()
+                    foodwin.box()
+                    foodwin.refresh()
+                    FL = Food().getListNamesSortedByType(ftype)
+                    modified = True
+
+            elif c == ord('U'):
+                allok = Food().unfavoriteFoodByName(FL[pos + topindex])
+                if allok:
+                    main.menu.showMessage("Food " + FL[pos + topindex] + " unfavorited")
+                    foodwin.erase()
+                    foodwin.box()
+                    foodwin.refresh()
+                    FL = Food().getListNamesSortedByType(ftype)
+                    modified = True
+
+            elif c == ord('f'):
+                genrecomm = True
+                if meal == "generic meal":
+                    genrecomm = False
+
+                textmeal = ""
+                for onemeal in meal_list:
+                    textmeal += onemeal + " "
+                textmeal = textmeal[0:-1]
+
+                carbhydr = 0
+                for c in carbls:
+                    carbhydr += c
+
+                if modified:
+                    main.database.saveFood()
+
+                return carbhydr, textmeal, genrecomm
+
+            elif c == 27:  # ESC
+                if modified:
+                    main.database.saveFood()
+                return False, False, False
+
+    def goBack(self):
+        self.MENU = self.PARENTMENU.pop()
+        self.POS = self.OLDPOS.pop()
+
+    def goMain(self):
+        self.MENU = self.MENUROOT
+        self.POS = 0
+
+        self.PARENTMENU = [ None ]
+        self.OLDPOS = [ None ]
+
+    def goMenu(self, menu):
+        self.PARENTMENU.append(self.MENU)
+        self.OLDPOS.append(self.POS)
+
+        self.MENU = menu
+        self.POS = 0
+
+
+def setupvars():
+    need_to_write = None
+    conf = ConfigParser.RawConfigParser()
+
+    if not exists(expanduser("~/.dpy")):
+        mkdir(expanduser("~/.dpy"))
+
+    try:
+        conf.read([expanduser("~/.dpy/config")])
+    except:
+        need_to_write = True
+
+    try:
+        setupvars.dbpath = conf.get("main", "dbpath")
+    except:
+        setupvars.dbpath = "~/.dpy/dpy.db"
+
+    try:
+        setupvars.language = conf.get("main", "language")
+    except:
+        setupvars.language = main.menu.getSelection("Language",
+            ["en", "es"])
+        if not setupvars.language:
+            setupvars.language = "en"
+        need_to_write = True
+
+    # por defecto debería probarse wxt
+    try:
+        setupvars.gplotterm = conf.get("gnuplot", "terminal")
+    except:
+        setupvars.gplotterm = "term wxt font \"arial,10\" fontscale 0.9 persist"
+        need_to_write = True
+
+    try:
+        setupvars.gplotsizesmall = conf.get("gnuplot", "size_small")
+    except:
+        setupvars.gplotsizesmall = "size 550, 300"
+        need_to_write = True
+
+    try:
+        setupvars.gplotsizelong = conf.get("gnuplot", "size_long")
+    except:
+        setupvars.gplotsizelong = "size 700, 300"
+        need_to_write = True
+
+    try:
+        setupvars.startoftheday = conf.get("advanced", "startoftheday")
+    except:
+        setupvars.startoftheday = "05:00:00"
+        need_to_write = True
+
+    # all other initialization stuff
+    while not exists(expanduser(setupvars.dbpath)):
+
+        answer = main.menu.getSelection("Database not found",
+            ["Create a new one", "Use an existing Diabetpy database"])
+
+        if answer == "Create a new one":
+            main.database.dbpath = expanduser(setupvars.dbpath)
+            main.database.createDatabase()
+        else:
+            setupvars.dbpath = main.menu.getData("Path to database")
+
+        need_to_write = True
+
+    main.database.dbpath = expanduser(setupvars.dbpath)
+    main.database.startoftheday = setupvars.startoftheday
+
+
+    if not main.database.checkDatabase():
+        main.database.createDatabase()
+
+    main.database.loadProfiles() # primero cargamos los datos de la db (profiles)
+    Profiles().calculateParams() # intentamos sacar los parámetros
+    main.database.calculateParamsFromDatabase() # Si no, se intenta calcular desde la db (meals)
+
+    main.bye = False
+
+    if need_to_write:
+        writeconfig()
+
+def writeconfig():
+    conf = ConfigParser.RawConfigParser()
+
+    conf.add_section("main")
+    conf.set("main", "dbpath", setupvars.dbpath)
+    conf.set("main", "language", setupvars.language)
+
+    conf.add_section("gnuplot")
+    conf.set("gnuplot", "terminal", setupvars.gplotterm)
+    conf.set("gnuplot", "size_long", setupvars.gplotsizelong)
+    conf.set("gnuplot", "size_small", setupvars.gplotsizesmall)
+
+    conf.add_section("advanced")
+    conf.set("advanced", "startoftheday", setupvars.startoftheday)
+
+    with open(expanduser('~/.dpy/config'), 'wb') as configfile:
+        conf.write(configfile)
+
+def safequit():
+    curses.initscr()
+    curses.nocbreak()
+    curses.echo()
+    curses.endwin()
+
+def main():
+    """
+    Aquí en main, declaramos los dos objetos principales que
+    necesitaremos. Se lee la configuración del fichero config en el HOME,
+    y si no existe se crea. Para terminar arrancamos el menú.
+    """
+    main.menu = DpyMenu()
+    main.database = DpyDb()
+
+    setupvars()
+
+    while not main.bye:
+        main.menu.run()
+
+    safequit()
+    exit(0)
+
+if __name__ == "__main__":
+    try:
+        main()
+
+    except:
+        safequit()
+        traceback.print_exc()
